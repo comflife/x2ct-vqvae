@@ -20,6 +20,9 @@ def get_config():
     run.visdom_server = 'http://localhost'
     run.visdom_port = 8097
     run.log_to_file = False
+    # GPU 설정
+    run.gpu_id = 1  # 사용할 GPU 번호 (0,1,2,3 중 선택)
+    run.use_cuda = True
 
     #######################################################################
     ############################# DATA CONFIG #############################
@@ -42,7 +45,7 @@ def get_config():
     #######################################################################
     config.train = train = ConfigDict()
     train.amp = True
-    train.batch_size = FieldReference(4)
+    train.batch_size = FieldReference(1)  # 메모리 절약을 위해 배치 크기 줄임
     # How often to plot new loss values to graphs
     train.plot_graph_steps = 100
     # How often to plot reconstruction images

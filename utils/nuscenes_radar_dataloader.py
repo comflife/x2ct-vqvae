@@ -55,10 +55,16 @@ class NuScenesRadarDataset(Dataset):
             bev: numpy array [H, W] BEV 이미지
         """
         if len(points) == 0:
-            return np.zeros((self.bev_size, self.bev_size), dtype=np.float32)
+            bev_h = self.bev_size[0] if isinstance(self.bev_size, (list, tuple)) else self.bev_size
+            bev_w = self.bev_size[1] if isinstance(self.bev_size, (list, tuple)) else self.bev_size
+            return np.zeros((bev_h, bev_w), dtype=np.float32)
         
         x_min, y_min = self.point_cloud_range[0], self.point_cloud_range[1]
         x_max, y_max = self.point_cloud_range[3], self.point_cloud_range[4]
+        
+        # BEV 크기 설정
+        bev_h = self.bev_size[0] if isinstance(self.bev_size, (list, tuple)) else self.bev_size
+        bev_w = self.bev_size[1] if isinstance(self.bev_size, (list, tuple)) else self.bev_size
         
         # 점들을 BEV 그리드에 매핑
         x_coords = points[:, 0]
@@ -70,26 +76,26 @@ class NuScenesRadarDataset(Dataset):
                     (y_coords >= y_min) & (y_coords <= y_max)
         
         if not np.any(valid_mask):
-            return np.zeros((self.bev_size, self.bev_size), dtype=np.float32)
+            return np.zeros((bev_h, bev_w), dtype=np.float32)
         
         x_coords = x_coords[valid_mask]
         y_coords = y_coords[valid_mask]
         intensities = intensities[valid_mask]
         
         # 픽셀 좌표로 변환
-        x_img = ((x_coords - x_min) / (x_max - x_min) * (self.bev_size - 1)).astype(int)
-        y_img = ((y_coords - y_min) / (y_max - y_min) * (self.bev_size - 1)).astype(int)
+        x_img = ((x_coords - x_min) / (x_max - x_min) * (bev_w - 1)).astype(int)
+        y_img = ((y_coords - y_min) / (y_max - y_min) * (bev_h - 1)).astype(int)
         
         # 범위 체크
-        valid_pixels = (x_img >= 0) & (x_img < self.bev_size) & \
-                      (y_img >= 0) & (y_img < self.bev_size)
+        valid_pixels = (x_img >= 0) & (x_img < bev_w) & \
+                      (y_img >= 0) & (y_img < bev_h)
         
         x_img = x_img[valid_pixels]
         y_img = y_img[valid_pixels]
         intensities = intensities[valid_pixels]
         
         # BEV 이미지 생성
-        bev = np.zeros((self.bev_size, self.bev_size), dtype=np.float32)
+        bev = np.zeros((bev_h, bev_w), dtype=np.float32)
         
         if len(x_img) > 0:
             # 동일한 픽셀에 여러 점이 있는 경우 최대값 사용

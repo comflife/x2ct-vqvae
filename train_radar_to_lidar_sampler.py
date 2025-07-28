@@ -36,7 +36,38 @@ flags.mark_flags_as_required(["config"])
 # Torch options
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def setup_device(config):
+    """GPU 설정 및 디바이스 선택"""
+    if hasattr(config.run, 'use_cuda') and config.run.use_cuda and torch.cuda.is_available():
+        if hasattr(config.run, 'gpu_id'):
+            gpu_id = config.run.gpu_id
+            if gpu_id < torch.cuda.device_count():
+                torch.cuda.set_device(gpu_id)
+                device = torch.device(f'cuda:{gpu_id}')
+                log(f"Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+                log(f"GPU Memory: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.1f} GB")
+            else:
+                device = torch.device('cuda')
+                log(f"GPU {gpu_id} not available, using default GPU")
+        else:
+            device = torch.device('cuda')
+            log("Using default CUDA device")
+    else:
+        device = torch.device('cpu')
+        log("Using CPU")
+    
+    return device
+
+def log_gpu_memory():
+    """GPU 메모리 사용량 로그"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        log(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+
+# Device will be set in main()
+device = None
 
 def update_model_weights(optim, loss, amp=False, scaler=None):
     optim.zero_grad()
@@ -104,10 +135,11 @@ def load_pretrained_vqgan(model_path, model_class, config, device, is_ultralidar
 def generate_latent_ids(H, ae_radar, ae_lidar, train_loader, test_loader):
     """Radar BEV와 Lidar BEV 데이터로부터 잠재 코드 생성"""
     log("Generating latent codes...")
+    log_gpu_memory()
     
     def generate_latents_from_loader(dataloader, split_name):
         latent_ids = []
-        for data in tqdm(dataloader, desc=f"Processing {split_name}"):
+        for i, data in enumerate(tqdm(dataloader, desc=f"Processing {split_name}")):
             
             # NuScenes 데이터 형식 처리
             if "radar_bev" in data and "lidar_bev" in data:
@@ -155,6 +187,11 @@ def generate_latent_ids(H, ae_radar, ae_lidar, train_loader, test_loader):
                 "radar_embed": radar_quant.cpu().contiguous(),
                 "lidar_codes": lidar_min_encoding_indices.cpu().contiguous()
             })
+            
+            # 주기적으로 GPU 메모리 정리
+            if i % 100 == 0:
+                torch.cuda.empty_cache()
+                log_gpu_memory()
         
         return latent_ids
     
@@ -290,9 +327,14 @@ def train(H, sampler, sampler_ema, generator_radar, generator_lidar, train_loade
                 wandb.log(wandb_dict, step=global_step)
 
 def main(argv):
+    global device
     H = FLAGS.config
     H.radar_config = FLAGS.radar_config
     H.lidar_config = FLAGS.lidar_config
+    
+    # GPU 설정
+    device = setup_device(H)
+    
     train_kwargs = {}
 
     # wandb 초기화
@@ -391,9 +433,9 @@ def main(argv):
             )
         
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False, 
-                                  num_workers=2, pin_memory=True, drop_last=False)
+                                  num_workers=0, pin_memory=True, drop_last=False)  # num_workers=0으로 설정
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, 
-                                 num_workers=2, pin_memory=True, drop_last=False)
+                                 num_workers=0, pin_memory=True, drop_last=False)   # num_workers=0으로 설정
         
         generate_latent_ids(H, ae_radar, ae_lidar, train_loader, test_loader)
         
