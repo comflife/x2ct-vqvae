@@ -31,7 +31,7 @@ def get_config():
     # NuScenes 데이터 경로
     data.data_root = "/data1/nuScenes/"  # NuScenes 데이터 루트 경로
     data.data_dir = "/data1/nuScenes/"  # 호환성을 위한 별칭
-    data.img_size = FieldReference(640)  # UltraLiDAR BEV 크기
+    data.img_size = FieldReference(320)  # 메모리와 성능의 균형을 위해 320x320 사용
     data.num_radar_views = 1  # radar는 단일 뷰
     data.channels = 1  # Radar BEV 채널 수
     data.load_res = None
@@ -39,6 +39,9 @@ def get_config():
     data.cupy = False
     data.use_synthetic = False
     data.loader = "nuscenes_radar_lidar"  # NuScenes radar+lidar 데이터로더 사용
+    # 실제 존재하는 pkl 파일들 (tiny 버전 사용)
+    data.train_ann_file = "nuscenes_infos_val_radar_tiny.pkl"  # 우선 작은 데이터로 테스트
+    data.val_ann_file = "nuscenes_infos_val_radar_tiny.pkl"
 
     #######################################################################
     ########################### TRAINING CONFIG ###########################
@@ -77,7 +80,8 @@ def get_config():
     # Number of layers
     model.n_layers = 12
     # Max input size to initialise positional embeddings etc at
-    model.block_size = 1024
+    # 320x320 BEV: Radar context (1600) + Lidar target (1600) = 3200 토큰
+    model.block_size = 4096  # 여유를 위해 4096으로 설정
     # Dropout params
     model.attn_pdrop = 0.1
     model.embd_pdrop = 0.1

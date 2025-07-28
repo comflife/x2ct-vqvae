@@ -64,7 +64,10 @@ def log_gpu_memory():
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        log(f"GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
+        usage_percent = (allocated / total_memory) * 100
+        log(f"GPU Memory - Allocated: {allocated:.2f}GB ({usage_percent:.1f}%), Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB, Total: {total_memory:.1f}GB")
 
 # Device will be set in main()
 device = None
@@ -151,9 +154,9 @@ def generate_latent_ids(H, ae_radar, ae_lidar, train_loader, test_loader):
                 radar_latents = ae_radar.encoder(radar_bev)
                 radar_quant, _, _ = ae_radar.quantize(radar_latents)
                 
-                # BEV는 단일 뷰이므로 형태 조정
+                # 올바른 reshape: (B, C, H, W) -> (B, H*W, C)
                 B, C, H, W = radar_quant.shape
-                radar_quant = radar_quant.view(B, 1, H*W, C)  # (B, 1, H*W, C)
+                radar_quant = radar_quant.permute(0, 2, 3, 1).contiguous().view(B, H*W, C)  # (B, seq_len=H*W, emb_dim=C)
                 
                 # Lidar BEV 인코딩 (UltraLiDAR wrapper 사용)
                 lidar_latents = ae_lidar.encoder(lidar_bev)
@@ -184,14 +187,9 @@ def generate_latent_ids(H, ae_radar, ae_lidar, train_loader, test_loader):
                 continue
             
             latent_ids.append({
-                "radar_embed": radar_quant.cpu().contiguous(),
-                "lidar_codes": lidar_min_encoding_indices.cpu().contiguous()
+                "radar_embed": radar_quant.cpu().contiguous(),  # (B, seq_len, emb_dim)
+                "lidar_codes": lidar_min_encoding_indices.cpu().contiguous()  # (B, seq_len)
             })
-            
-            # 주기적으로 GPU 메모리 정리
-            if i % 100 == 0:
-                torch.cuda.empty_cache()
-                log_gpu_memory()
         
         return latent_ids
     
@@ -221,37 +219,29 @@ def train(H, sampler, sampler_ema, generator_radar, generator_lidar, train_loade
             # 데이터 키 확인 및 호환성 처리
             if "radar_embed" in data:
                 # 이미 처리된 latent 데이터
-                context = data["radar_embed"].to(device, non_blocking=True)  # Radar context
-                x = data["lidar_codes"].to(device, non_blocking=True)         # Lidar target codes
+                context = data["radar_embed"].to(device, non_blocking=True)  # Radar context: (B, seq_len, emb_dim)
+                x = data["lidar_codes"].to(device, non_blocking=True)         # Lidar target codes: (B, seq_len)
             else:
                 # 예상치 못한 데이터 형식
                 log(f"Warning: Unexpected data format. Keys: {list(data.keys())}")
                 continue
             
-            # Radar view 선택 (단일 뷰인 경우 처리)
-            if len(context.shape) == 4:  # (B, H*W, C) 형태인 경우
-                context = rearrange(context, "b () l c -> b l c")
-            elif len(context.shape) == 5 and context.size(2) > H.data.num_radar_views:
-                # 다중 뷰인 경우 랜덤 선택
-                indices = torch.stack([
-                    torch.from_numpy(np.random.choice(context.size(2), H.data.num_radar_views, replace=False)) 
-                    for _ in range(context.size(0))
-                ]).to(device)
-                indices = repeat(indices, "b r -> b () r l c", l=context.size(3), c=context.size(4))
-                context = torch.gather(context, 2, indices)
-                context = rearrange(context, "b () r l c -> b (r l) c")
-            else:
-                # 단일 뷰 또는 적절한 다중 뷰
-                if len(context.shape) == 5:
-                    context = rearrange(context, "b () r l c -> b (r l) c")
-                elif len(context.shape) == 4:
-                    context = rearrange(context, "b () l c -> b l c")
+            # Context는 이미 올바른 형태 (B, seq_len, emb_dim)이므로 추가 reshape 불필요
+            # 단, 기존 코드와의 호환성을 위해 차원 확인
+            if len(context.shape) == 4 and context.size(1) == 1:
+                # (B, 1, seq_len, emb_dim) 형태인 경우 squeeze
+                context = context.squeeze(1)  # (B, seq_len, emb_dim)
+            elif len(context.shape) != 3:
+                log(f"Warning: Unexpected context shape: {context.shape}")
+                continue
             
-            # Target codes 형태 조정
-            if len(x.shape) == 3:
-                x = rearrange(x, "b () l -> b l")
-            elif len(x.shape) == 1:
-                x = x.unsqueeze(0)  # 배치 차원 추가
+            # Target codes도 올바른 형태 확인  
+            if len(x.shape) == 3 and x.size(1) == 1:
+                # (B, 1, seq_len) 형태인 경우 squeeze
+                x = x.squeeze(1)  # (B, seq_len)
+            elif len(x.shape) != 2:
+                log(f"Warning: Unexpected target shape: {x.shape}")
+                continue
 
             if global_step < H.optimizer.warmup_steps:
                 optim_warmup(global_step, optim, H.optimizer.learning_rate, H.optimizer.warmup_steps)
@@ -391,15 +381,19 @@ def main(argv):
                 bev_size=H.radar_config.data.img_size
             )
         elif H.data.loader == "nuscenes_radar_lidar":
+            # 설정에서 지정된 pkl 파일 사용
+            train_ann_file = getattr(H.data, 'train_ann_file', 'nuscenes_infos_train_radar.pkl')
+            val_ann_file = getattr(H.data, 'val_ann_file', 'nuscenes_infos_val_radar.pkl')
+            
             train_dataset = NuScenesRadarLidarDataset(
                 data_root=H.data.data_root,
-                ann_file=os.path.join(H.data.data_root, "nuscenes_infos_train_radar.pkl"),
+                ann_file=os.path.join(H.data.data_root, train_ann_file),
                 train=True,
                 bev_size=H.radar_config.data.img_size
             )
             test_dataset = NuScenesRadarLidarDataset(
                 data_root=H.data.data_root,
-                ann_file=os.path.join(H.data.data_root, "nuscenes_infos_val_radar.pkl"),
+                ann_file=os.path.join(H.data.data_root, val_ann_file),
                 train=False,
                 bev_size=H.radar_config.data.img_size
             )
@@ -433,9 +427,9 @@ def main(argv):
             )
         
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=False, 
-                                  num_workers=0, pin_memory=True, drop_last=False)  # num_workers=0으로 설정
+                                  num_workers=2, pin_memory=True, drop_last=False)
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, 
-                                 num_workers=0, pin_memory=True, drop_last=False)   # num_workers=0으로 설정
+                                 num_workers=2, pin_memory=True, drop_last=False)
         
         generate_latent_ids(H, ae_radar, ae_lidar, train_loader, test_loader)
         
@@ -524,6 +518,8 @@ def main(argv):
         log("Using random initialization for embedding weight.")
         lidar_embedding_weight = torch.randn(H.lidar_config.model.codebook_size, H.lidar_config.model.emb_dim)
     
+    # ct_config를 lidar_config로 대체하여 sampler 생성
+    H.ct_config = H.lidar_config  # 호환성을 위해 ct_config에 lidar_config 할당
     sampler = get_sampler(H, lidar_embedding_weight.to(device)).to(device)
     sampler_ema = copy.deepcopy(sampler).to(device)
 

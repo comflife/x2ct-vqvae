@@ -7,15 +7,15 @@ def get_config():
     config.model = ml_collections.ConfigDict()
     config.model.name = 'ultralidar_radar_vqgan'
     config.model.codebook_size = 1024  # UltraLiDAR uses 1024 codebook size
-    config.model.emb_dim = 256  # Embedding dimension
+    config.model.emb_dim = 1024  # UltraLiDAR embedding dimension - IMPORTANT!
     config.model.n_hiddens = 240
     config.model.n_res_layers = 4
     config.model.downsample = [4, 4]  # Downsample factor for BEV
-    config.model.latent_shape = [40, 40]  # 640/16 = 40 for each dimension
+    config.model.latent_shape = [40, 40]  # 320/8 = 40 for each dimension
     
     # Data configuration
     config.data = ml_collections.ConfigDict()
-    config.data.img_size = [640, 640]  # UltraLiDAR BEV size
+    config.data.img_size = [320, 320]  # 메모리 절약을 위해 320x320으로 축소
     config.data.channels = 1  # Single channel for radar BEV
     
     # Training configuration (not used for inference)
