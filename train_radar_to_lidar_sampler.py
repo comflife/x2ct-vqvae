@@ -266,31 +266,31 @@ def train(H, sampler, sampler_ema, generator_radar, generator_lidar, train_loade
                 wandb_dict.update(log_stats(H, global_step, tracked_stats, log_to_file=H.run.log_to_file))
             
             ## Plot reconstructions
-            if global_step % H.train.plot_recon_steps == 0 and global_step > 0:
-                # 원본 Lidar BEV 재구성
-                x_img = reconstruct_from_codes(H, sampler, x[:H.diffusion.sampling_batch_size], generator_lidar)
-                wandb_dict.update(plot_images(H, x_img, title='gt_lidar_bev', vis=vis))
+            # if global_step % H.train.plot_recon_steps == 0 and global_step > 0:
+            #     # 원본 Lidar BEV 재구성
+            #     x_img = reconstruct_from_codes(H, sampler, x[:H.diffusion.sampling_batch_size], generator_lidar)
+            #     wandb_dict.update(plot_images(H, x_img, title='gt_lidar_bev', vis=vis))
                 
-                # 샘플링된 Lidar BEV
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast(enabled=H.train.amp):
-                        x_sampled = sampler.sample(
-                            context=context[:H.diffusion.sampling_batch_size], 
-                            sample_steps=H.diffusion.sampling_steps, 
-                            temp=H.diffusion.sampling_temp
-                        )
-                x_sampled_img = reconstruct_from_codes(H, sampler, x_sampled, generator_lidar)
-                wandb_dict.update(plot_images(H, x_sampled_img, title='sampled_lidar_bev', vis=vis))
+            #     # 샘플링된 Lidar BEV
+            #     with torch.no_grad():
+            #         with torch.cuda.amp.autocast(enabled=H.train.amp):
+            #             x_sampled = sampler.sample(
+            #                 context=context[:H.diffusion.sampling_batch_size], 
+            #                 sample_steps=H.diffusion.sampling_steps, 
+            #                 temp=H.diffusion.sampling_temp
+            #             )
+            #     x_sampled_img = reconstruct_from_codes(H, sampler, x_sampled, generator_lidar)
+            #     wandb_dict.update(plot_images(H, x_sampled_img, title='sampled_lidar_bev', vis=vis))
                 
                 # 최대 확률 샘플링
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast(enabled=H.train.amp):
-                        x_maxprob = sampler.sample_max_probability(
-                            context=context[:H.diffusion.sampling_batch_size], 
-                            sample_steps=H.diffusion.sampling_steps
-                        )
-                x_maxprob_img = reconstruct_from_codes(H, sampler, x_maxprob, generator_lidar)
-                wandb_dict.update(plot_images(H, x_maxprob_img, title='maxprob_lidar_bev', vis=vis))
+                # with torch.no_grad():
+                #     with torch.cuda.amp.autocast(enabled=H.train.amp):
+                #         x_maxprob = sampler.sample_max_probability(
+                #             context=context[:H.diffusion.sampling_batch_size], 
+                #             sample_steps=H.diffusion.sampling_steps
+                #         )
+                # x_maxprob_img = reconstruct_from_codes(H, sampler, x_maxprob, generator_lidar)
+                # wandb_dict.update(plot_images(H, x_maxprob_img, title='maxprob_lidar_bev', vis=vis))
             
             ## Evaluate on test set
             if global_step % H.train.eval_steps == 0 and global_step > 0:
@@ -457,6 +457,10 @@ def main(argv):
         is_ultralidar=True,  # lidar도 UltraLiDAR 모델 사용
         model_type='lidar'
     )
+    
+    # 모델들을 eval 모드로 설정 (추론용)
+    generator_radar.eval()
+    generator_lidar.eval()
 
     # Sampler 생성
     # lidar VQGAN에서 embedding weight 추출

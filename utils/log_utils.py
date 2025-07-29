@@ -52,18 +52,39 @@ def log_stats(H, step, stats, test=False, log_to_file=False):
     log(log_str, log_to_file=log_to_file)
     return print_stats
 
-def plot_images(H, x, title='', norm=False, vis=None):
-    # x = (x + 1) / 2 if norm else x
-    x = torch.clamp(x, -1, 1)
-    # x = (x - x.min()) / (x.max() - x.min())
+# def plot_images(H, x, title='', norm=False, vis=None):
+#     # x = (x + 1) / 2 if norm else x
+#     x = torch.clamp(x, -1, 1)
+#     # x = (x - x.min()) / (x.max() - x.min())
 
-    # visdom
-    if H.run.enable_visdom and vis is not None:
-        vis.images(x, win=title, opts=dict(title=title))
+#     # visdom
+#     if H.run.enable_visdom and vis is not None:
+#         vis.images(x, win=title, opts=dict(title=title))
     
-    # wandb
-    x = wandb.Image(x, caption=title)
-    return {title: x}
+#     # wandb
+#     x = wandb.Image(x, caption=title)
+#     return {title: x}
+def plot_images(H, x, title, vis=None):
+    # Handle batch dimension if present
+    if x.dim() == 4:
+        # Assume [B, C, H, W] - create list of images
+        images = []
+        for i in range(x.size(0)):
+            img = x[i]
+            # Normalize if needed (assuming values are in [0,1] or adjust accordingly)
+            if img.min() < 0 or img.max() > 1:
+                img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+            # Permute to [H, W, C] for single image
+            img = img.permute(1, 2, 0).cpu().numpy()
+            images.append(wandb.Image(img, caption=f"{title}_{i}"))
+        return {title: images}
+    else:
+        # Original logic for single image (assuming [C, H, W])
+        # Normalize if needed
+        if x.min() < 0 or x.max() > 1:
+            x = (x - x.min()) / (x.max() - x.min() + 1e-8)
+        x = wandb.Image(x, caption=title)
+        return {title: x}
 
 
 def start_training_log(hparams):

@@ -200,6 +200,11 @@ class SimpleUltraLiDARWrapper(nn.Module):
             'emb_loss': emb_loss,
             'quant_stats': quant_stats
         }
+    
+    def __call__(self, x):
+        """직접 호출 시에는 재구성된 이미지만 반환 (VQGAN 호환성)"""
+        # 추론 시에는 재구성된 이미지만 반환
+        return self.generator(x)
 
 
 def load_simple_ultralidar_model(checkpoint_path, model_type='radar'):

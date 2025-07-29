@@ -44,13 +44,29 @@ def latent_ids_to_onehot(latent_ids, latent_shape, codebook_size):
         codebook_size
     ).to(latent_ids.device)
     encodings.scatter_(1, min_encoding_indices, 1)
-    one_hot = encodings.view(
-        latent_ids.shape[0],
-        latent_shape[1],
-        latent_shape[2],
-        latent_shape[3],
-        codebook_size
-    )
+    
+    # Handle different latent_shape formats
+    if len(latent_shape) == 2:
+        # [H, W] format -> assume single batch and channel
+        h, w = latent_shape
+        one_hot = encodings.view(
+            latent_ids.shape[0],
+            h,
+            w,
+            codebook_size
+        )
+    elif len(latent_shape) == 4:
+        # [B, C, H, W] format
+        one_hot = encodings.view(
+            latent_ids.shape[0],
+            latent_shape[1],
+            latent_shape[2],
+            latent_shape[3],
+            codebook_size
+        )
+    else:
+        raise ValueError(f"Unsupported latent_shape format: {latent_shape}")
+    
     return one_hot.reshape(one_hot.shape[0], -1, codebook_size)
 
 
