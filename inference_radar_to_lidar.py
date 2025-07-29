@@ -236,7 +236,7 @@ def bev_to_points(bev_image, intensity_threshold=0.01):
     return points
 
 def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_gt, lidar_pred, sample_idx, output_dir):
-    """원본 points와 BEV 결과를 모두 시각화"""
+    """원본 points와 BEV 결과를 모두 시각화 - 라이다는 포인트 클라우드로"""
     
     # 원본 데이터를 numpy로 변환
     radar_img = radar_bev[0, 0].cpu().numpy()  # (H, W)
@@ -258,18 +258,20 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     log(f"Data ranges - Lidar Pred: [{lidar_pred_img.min():.3f}, {lidar_pred_img.max():.3f}]")
     
     # BEV를 포인트로 변환
-    radar_bev_points = bev_to_points(radar_img, intensity_threshold=0.01)
-    lidar_gt_bev_points = bev_to_points(lidar_gt_img, intensity_threshold=0.01) if lidar_gt_img is not None else np.zeros((0, 3))
-    lidar_pred_bev_points = bev_to_points(lidar_pred_img, intensity_threshold=0.01)
+    radar_bev_points = bev_to_points(radar_img, intensity_threshold=0.01)  # Radar는 기존 방식
+    
+    # LiDAR는 포인트 클라우드로 변환
+    lidar_gt_points = bev_to_points_lidar(lidar_gt_img, intensity_threshold=0.01) if lidar_gt_img is not None else np.zeros((0, 4))
+    lidar_pred_points = bev_to_points_lidar(lidar_pred_img, intensity_threshold=0.01)
     
     # 원본 points 준비
     radar_points_np = radar_points.cpu().numpy() if radar_points is not None else np.zeros((0, 6))
     lidar_points_np = lidar_points.cpu().numpy() if lidar_points is not None else np.zeros((0, 6))
     
     log(f"Original point counts - Radar: {len(radar_points_np)}, Lidar: {len(lidar_points_np)}")
-    log(f"BEV point counts - Radar: {len(radar_bev_points)}, Lidar GT: {len(lidar_gt_bev_points)}, Lidar Pred: {len(lidar_pred_bev_points)}")
+    log(f"Generated point counts - Radar BEV: {len(radar_bev_points)}, Lidar GT: {len(lidar_gt_points)}, Lidar Pred: {len(lidar_pred_points)}")
     
-    # 시각화 - 원본 points와 BEV 결과
+    # 시각화 - 원본 points와 생성된 결과
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # 첫 번째 행: 원본 points
@@ -292,7 +294,7 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     if len(lidar_points_np) > 0:
         scatter2 = axes[0, 1].scatter(lidar_points_np[:, 0], lidar_points_np[:, 1], 
                                      c=lidar_points_np[:, 3] if lidar_points_np.shape[1] > 3 else 'red', 
-                                     cmap='hot', s=2, alpha=0.7)
+                                     cmap='hot', s=1, alpha=0.6)
         if lidar_points_np.shape[1] > 3:
             plt.colorbar(scatter2, ax=axes[0, 1], shrink=0.8)
     axes[0, 1].set_title(f'Original Lidar Points\n{len(lidar_points_np)} points', 
@@ -308,8 +310,8 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     axes[0, 2].text(0.5, 0.5, 'Original Points\nComparison', ha='center', va='center', 
                    transform=axes[0, 2].transAxes, fontsize=14, fontweight='bold')
     
-    # 두 번째 행: BEV 결과
-    # Radar BEV
+    # 두 번째 행: 생성된 결과
+    # Radar BEV (기존 방식)
     if len(radar_bev_points) > 0:
         scatter3 = axes[1, 0].scatter(radar_bev_points[:, 0], radar_bev_points[:, 1], 
                                      c=radar_bev_points[:, 2], cmap='viridis', s=2, alpha=0.7)
@@ -322,12 +324,12 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     axes[1, 0].set_ylim(-50, 50)
     axes[1, 0].grid(True, alpha=0.3)
     
-    # Ground Truth Lidar BEV
-    if len(lidar_gt_bev_points) > 0:
-        scatter4 = axes[1, 1].scatter(lidar_gt_bev_points[:, 0], lidar_gt_bev_points[:, 1], 
-                                     c=lidar_gt_bev_points[:, 2], cmap='hot', s=2, alpha=0.7)
+    # Ground Truth Lidar Points (포인트 클라우드)
+    if len(lidar_gt_points) > 0:
+        scatter4 = axes[1, 1].scatter(lidar_gt_points[:, 0], lidar_gt_points[:, 1], 
+                                     c=lidar_gt_points[:, 3], cmap='hot', s=1, alpha=0.6)
         plt.colorbar(scatter4, ax=axes[1, 1], shrink=0.8)
-    axes[1, 1].set_title(f'GT Lidar BEV\n{len(lidar_gt_bev_points)} points', 
+    axes[1, 1].set_title(f'GT Lidar Points\n{len(lidar_gt_points)} points', 
                         fontsize=12, fontweight='bold')
     axes[1, 1].set_xlabel('X (m)')
     axes[1, 1].set_ylabel('Y (m)')
@@ -335,12 +337,12 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     axes[1, 1].set_ylim(-50, 50)
     axes[1, 1].grid(True, alpha=0.3)
     
-    # Predicted Lidar BEV
-    if len(lidar_pred_bev_points) > 0:
-        scatter5 = axes[1, 2].scatter(lidar_pred_bev_points[:, 0], lidar_pred_bev_points[:, 1], 
-                                     c=lidar_pred_bev_points[:, 2], cmap='hot', s=2, alpha=0.7)
+    # Predicted Lidar Points (포인트 클라우드)
+    if len(lidar_pred_points) > 0:
+        scatter5 = axes[1, 2].scatter(lidar_pred_points[:, 0], lidar_pred_points[:, 1], 
+                                     c=lidar_pred_points[:, 3], cmap='hot', s=1, alpha=0.6)
         plt.colorbar(scatter5, ax=axes[1, 2], shrink=0.8)
-    axes[1, 2].set_title(f'Predicted Lidar BEV\n{len(lidar_pred_bev_points)} points', 
+    axes[1, 2].set_title(f'Predicted Lidar Points\n{len(lidar_pred_points)} points', 
                         fontsize=12, fontweight='bold')
     axes[1, 2].set_xlabel('X (m)')
     axes[1, 2].set_ylabel('Y (m)')
@@ -351,6 +353,10 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'inference_result_{sample_idx}.png'), dpi=300, bbox_inches='tight')
     plt.close()
+    
+    # 추가: 히트맵 비교도 별도로 저장
+    if lidar_gt_img is not None:
+        visualize_heatmaps(radar_img, lidar_gt_img, lidar_pred_img, sample_idx, output_dir)
     
     # 차이 맵 생성 (GT가 있는 경우에만)
     if lidar_gt_img is not None:
@@ -392,6 +398,65 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
         log("No GT available for metric calculation")
         return None, None, None, None
 
+def visualize_heatmaps(radar_bev, lidar_gt, lidar_pred, sample_idx, output_dir):
+    """BEV를 직접 히트맵으로 시각화 (추가 시각화)"""
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # Radar BEV 히트맵
+    im1 = axes[0].imshow(radar_bev, cmap='viridis', origin='lower')
+    axes[0].set_title('Radar BEV (Input)')
+    plt.colorbar(im1, ax=axes[0])
+    
+    # GT Lidar BEV 히트맵
+    if lidar_gt is not None:
+        im2 = axes[1].imshow(lidar_gt, cmap='hot', origin='lower')
+        axes[1].set_title('GT Lidar BEV')
+        plt.colorbar(im2, ax=axes[1])
+    else:
+        axes[1].set_title('No GT Available')
+        axes[1].axis('off')
+    
+    # Predicted Lidar BEV 히트맵
+    im3 = axes[2].imshow(lidar_pred, cmap='hot', origin='lower')
+    axes[2].set_title('Predicted Lidar BEV')
+    plt.colorbar(im3, ax=axes[2])
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f'heatmap_{sample_idx}.png'), dpi=300)
+    plt.close()
+
+def save_pointclouds_as_ply(lidar_gt_points, lidar_pred_points, sample_idx, output_dir):
+    """포인트 클라우드를 PLY 파일로 저장 (Open3D 사용)"""
+    try:
+        import open3d as o3d
+        
+        # GT 포인트 클라우드 저장
+        if len(lidar_gt_points) > 0:
+            gt_pcd = o3d.geometry.PointCloud()
+            gt_pcd.points = o3d.utility.Vector3dVector(lidar_gt_points[:, :3])  # x, y, z
+            if lidar_gt_points.shape[1] > 3:
+                # intensity를 색상으로 변환
+                intensities = lidar_gt_points[:, 3]
+                colors = plt.cm.hot(intensities / intensities.max())[:, :3]
+                gt_pcd.colors = o3d.utility.Vector3dVector(colors)
+            o3d.io.write_point_cloud(os.path.join(output_dir, f'gt_lidar_sample_{sample_idx}.ply'), gt_pcd)
+        
+        # Predicted 포인트 클라우드 저장
+        if len(lidar_pred_points) > 0:
+            pred_pcd = o3d.geometry.PointCloud()
+            pred_pcd.points = o3d.utility.Vector3dVector(lidar_pred_points[:, :3])  # x, y, z
+            if lidar_pred_points.shape[1] > 3:
+                # intensity를 색상으로 변환
+                intensities = lidar_pred_points[:, 3]
+                colors = plt.cm.hot(intensities / intensities.max())[:, :3]
+                pred_pcd.colors = o3d.utility.Vector3dVector(colors)
+            o3d.io.write_point_cloud(os.path.join(output_dir, f'pred_lidar_sample_{sample_idx}.ply'), pred_pcd)
+        
+        log(f"Saved point clouds as PLY files for sample {sample_idx}")
+        
+    except ImportError:
+        log("Open3D not available, skipping PLY file generation")
 
 @torch.no_grad()
 def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lidar, radar_points, lidar_points, device):
@@ -598,6 +663,38 @@ def inference_single_sample_from_points(H, sampler, ae_radar, ae_lidar, generato
         'lidar_predicted': predicted_lidar,
         'inference_time': inference_time
     }
+
+def bev_to_points_lidar(bev_image, intensity_threshold=0.01, range_limit=50.0):
+    """BEV 이미지를 LiDAR 포인트로 변환 (3D 포인트 클라우드 형태)"""
+    if isinstance(bev_image, torch.Tensor):
+        bev_image = bev_image.cpu().numpy()
+    
+    # 2D BEV에서 임계값보다 큰 값들의 위치 찾기
+    if bev_image.ndim == 4:  # (1, 1, H, W)
+        bev_image = bev_image[0, 0]
+    elif bev_image.ndim == 3:  # (1, H, W)
+        bev_image = bev_image[0]
+    
+    y_indices, x_indices = np.where(bev_image > intensity_threshold)
+    
+    if len(x_indices) == 0:
+        return np.zeros((0, 4))  # x, y, z, intensity
+    
+    # 픽셀 좌표를 실제 좌표로 변환
+    height, width = bev_image.shape
+    x_coords = (x_indices / width) * (2 * range_limit) - range_limit  # [-50, 50]
+    y_coords = (y_indices / height) * (2 * range_limit) - range_limit  # [-50, 50]
+    
+    # Z 좌표는 0으로 설정 (BEV이므로)
+    z_coords = np.zeros_like(x_coords)
+    
+    # 강도값 추출
+    intensities = bev_image[y_indices, x_indices]
+    
+    # 포인트 클라우드 형태로 결합: [x, y, z, intensity]
+    points = np.stack([x_coords, y_coords, z_coords, intensities], axis=1)
+    return points
+
 
 def main(argv):
     H = FLAGS.config
