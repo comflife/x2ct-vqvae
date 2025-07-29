@@ -299,8 +299,20 @@ def train(H, sampler, sampler_ema, generator_radar, generator_lidar, train_loade
                     for test_data in test_loader:
                         test_context = test_data["radar_embed"].to(device, non_blocking=True)
                         test_x = test_data["lidar_codes"].to(device, non_blocking=True)
-                        test_context = rearrange(test_context, "b () r l c -> b (r l) c")
-                        test_x = rearrange(test_x, "b () l -> b l")
+                        
+                        # Training loop와 동일한 로직 적용
+                        if len(test_context.shape) == 4 and test_context.size(1) == 1:
+                            test_context = test_context.squeeze(1)
+                        elif len(test_context.shape) != 3:
+                            log(f"Warning: Unexpected test context shape: {test_context.shape}")
+                            continue
+                        
+                        if len(test_x.shape) == 3 and test_x.size(1) == 1:
+                            test_x = test_x.squeeze(1)
+                        elif len(test_x.shape) != 2:
+                            log(f"Warning: Unexpected test target shape: {test_x.shape}")
+                            continue
+                        
                         with torch.no_grad():
                             with torch.cuda.amp.autocast(enabled=H.train.amp):
                                 test_stats = sampler.train_iter(test_x, context=test_context, test=True)
