@@ -32,6 +32,8 @@ try:
 except ImportError:
     from mmcv.utils.config import Config
 from mmdet3d.datasets import build_dataset
+from mmdet3d.models import build_model
+from mmcv.runner import load_checkpoint
 
 # UltraLiDAR 플러그인 임포트 (모델 등록을 위해)
 import sys
@@ -103,50 +105,21 @@ def reconstruct_from_codes(H, sampler, x, generator):
     images = generator(q.float())
     return images
 
-def load_pretrained_vqgan(model_path, model_class, config, device, is_ultralidar=False, model_type='radar'):
-    """사전 훈련된 VQGAN 모델 로드"""
-    if is_ultralidar:
-        # 간단한 UltraLiDAR 모델 로드 (mmcv 의존성 없음)
-        try:
-            model = load_simple_ultralidar_model(model_path, model_type)
-            log(f"Successfully loaded simple UltraLiDAR {model_type} model from {model_path}")
-            return model.to(device)
-            
-        except Exception as e:
-            log(f"Error loading simple UltraLiDAR {model_type} model: {e}")
-            log("Falling back to standard VQGAN loading...")
-    
-    # 기존 VQGAN 로딩 방식
-    model = model_class(config)
-    
+def load_pretrained_vqgan(model_path, config_path, device, model_type='radar'):
+    """사전 훈련된 UltraLiDAR 모델 로드 (full mmdet3d loading)"""
+    cfg = Config.fromfile(config_path)
+    cfg.model.pretrained = None
+    cfg.model.train_cfg = None
+    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
     if os.path.exists(model_path):
-        log(f"Loading pretrained model from {model_path}")
-        checkpoint = torch.load(model_path, map_location=device)
-        
-        # 체크포인트 구조에 따라 state_dict 추출
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        elif 'model' in checkpoint:
-            state_dict = checkpoint['model']
-        else:
-            state_dict = checkpoint
-            
-        # 키 이름 조정 (필요한 경우)
-        cleaned_state_dict = {}
-        for key, value in state_dict.items():
-            # 'ae.' prefix 제거
-            if key.startswith('ae.'):
-                new_key = key[3:]
-            else:
-                new_key = key
-            cleaned_state_dict[new_key] = value
-            
-        model.load_state_dict(cleaned_state_dict, strict=False)
-        log(f"Successfully loaded model from {model_path}")
-    else:
-        log(f"Warning: Model file {model_path} not found. Using randomly initialized weights.")
-    
-    return model.to(device)
+        log(f"Loading checkpoint from {model_path}")
+        checkpoint = torch.load(model_path, map_location='cpu')
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        model.load_state_dict(state_dict, strict=False)
+    model.to(device)
+    model.eval()
+    log(f"Loaded full UltraLiDAR {model_type} model from {model_path} using config {config_path}")
+    return model
 
 def extract_points_from_data(data, H=None):
     """mmdet3d 데이터에서 points 추출"""
@@ -273,11 +246,14 @@ def load_dataset_mmdet3d(config_path, data_root, ann_file, train_mode=True):
     ann_file_abs = os.path.join(data_root, ann_file)
     log(f"Loading dataset with config: {config_path}, ann_file: {ann_file_abs}, train_mode: {train_mode}")
 
+    # Force test_mode=True to skip annotations
+    test_mode = True
+
     if train_mode:
         if hasattr(cfg.data, 'train'):
             cfg.data.train.data_root = data_root
             cfg.data.train.ann_file = ann_file_abs
-            cfg.data.train.test_mode = True
+            cfg.data.train.test_mode = test_mode
             dataset = build_dataset(cfg.data.train)
         else:
             raise ValueError("No train config found in cfg.data")
@@ -285,12 +261,12 @@ def load_dataset_mmdet3d(config_path, data_root, ann_file, train_mode=True):
         if hasattr(cfg.data, 'val'):
             cfg.data.val.data_root = data_root
             cfg.data.val.ann_file = ann_file_abs
-            cfg.data.val.test_mode = True
+            cfg.data.val.test_mode = test_mode
             dataset = build_dataset(cfg.data.val)
         elif hasattr(cfg.data, 'test'):
             cfg.data.test.data_root = data_root
             cfg.data.test.ann_file = ann_file_abs
-            cfg.data.test.test_mode = True
+            cfg.data.test.test_mode = test_mode
             dataset = build_dataset(cfg.data.test)
         else:
             raise ValueError("No val/test config found in cfg.data")
@@ -518,23 +494,9 @@ def main(argv):
     if not os.path.exists(latents_filepath):
         log("Creating latent codes...")
         
-        # 사전 훈련된 VQGAN 모델 로드
-        ae_radar = load_pretrained_vqgan(
-            H.model_paths.radar_vqgan_path, 
-            VQAutoEncoder2D, 
-            H.radar_config, 
-            device,
-            is_ultralidar=True,  # UltraLiDAR 모델임을 명시
-            model_type='radar'
-        )
-        ae_lidar = load_pretrained_vqgan(
-            H.model_paths.lidar_vqgan_path, 
-            VQAutoEncoder2D,  # 또는 VQAutoEncoder3D (lidar BEV 차원에 따라)
-            H.lidar_config, 
-            device,
-            is_ultralidar=True,  # lidar도 UltraLiDAR 모델 사용
-            model_type='lidar'
-        )
+        # 사전 훈련된 VQGAN 모델 로드 (full loading)
+        ae_radar = load_pretrained_vqgan(H.model_paths.radar_vqgan_path, FLAGS.radar_ultralidar_config, device, model_type='radar')
+        ae_lidar = load_pretrained_vqgan(H.model_paths.lidar_vqgan_path, FLAGS.lidar_ultralidar_config, device, model_type='lidar')
 
         # 데이터셋 로드 (mmdet3d 사용)
         train_radar_ann_file = H.data.radar_train_ann_file
@@ -559,85 +521,23 @@ def main(argv):
     # 잠재 코드 로더
     train_latent_loader, test_latent_loader = get_latent_loaders(H)
 
-    # Generator 로드
-    generator_radar = load_pretrained_vqgan(
-        H.model_paths.radar_vqgan_path, 
-        Generator2D, 
-        H.radar_config, 
-        device,
-        is_ultralidar=True,
-        model_type='radar'
-    )
-    generator_lidar = load_pretrained_vqgan(
-        H.model_paths.lidar_vqgan_path, 
-        Generator2D,  # 또는 Generator3D
-        H.lidar_config, 
-        device,
-        is_ultralidar=True,  # lidar도 UltraLiDAR 모델 사용
-        model_type='lidar'
-    )
+    # Generator 로드 (decoder part)
+    full_radar = load_pretrained_vqgan(H.model_paths.radar_vqgan_path, FLAGS.radar_ultralidar_config, device, model_type='radar')
+    generator_radar = full_radar.lidar_decoder  # assuming named lidar_decoder even for radar
+    full_lidar = load_pretrained_vqgan(H.model_paths.lidar_vqgan_path, FLAGS.lidar_ultralidar_config, device, model_type='lidar')
+    generator_lidar = full_lidar.lidar_decoder
     
     # 모델들을 eval 모드로 설정 (추론용)
     generator_radar.eval()
     generator_lidar.eval()
 
     # Sampler 생성
-    # lidar VQGAN에서 embedding weight 추출
+    # lidar VQGAN에서 embedding weight 추출 (from full model)
     try:
-        # UltraLiDAR 모델에서 임베딩 가중치 추출
-        if hasattr(generator_lidar, 'get_embedding_weight'):
-            lidar_embedding_weight = generator_lidar.get_embedding_weight()
-            log(f"Successfully extracted embedding weight from UltraLiDAR model: {lidar_embedding_weight.shape}")
-        else:
-            # 직접 체크포인트에서 추출
-            lidar_checkpoint = torch.load(H.model_paths.lidar_vqgan_path, map_location=device)
-            lidar_embedding_weight = None
-            
-            # 다양한 키 형식 시도
-            possible_keys = [
-                'vector_quantizer.embedding.weight',
-                'quantize.embedding.weight', 
-                'ae.quantize.embedding.weight',
-                'model.vector_quantizer.embedding.weight',
-                'state_dict.vector_quantizer.embedding.weight'
-            ]
-            
-            for key in possible_keys:
-                if key in lidar_checkpoint:
-                    lidar_embedding_weight = lidar_checkpoint[key]
-                    log(f"Found lidar embedding weight with key: {key}")
-                    break
-            
-            # state_dict가 중첩된 경우
-            if lidar_embedding_weight is None and 'state_dict' in lidar_checkpoint:
-                state_dict = lidar_checkpoint['state_dict']
-                for key in possible_keys:
-                    if key in state_dict:
-                        lidar_embedding_weight = state_dict[key]
-                        log(f"Found lidar embedding weight in state_dict with key: {key}")
-                        break
-            
-            # 키를 직접 순회하며 embedding.weight 포함된 키 찾기
-            if lidar_embedding_weight is None:
-                all_keys = list(lidar_checkpoint.keys())
-                if 'state_dict' in lidar_checkpoint:
-                    all_keys.extend([f"state_dict.{k}" for k in lidar_checkpoint['state_dict'].keys()])
-                
-                for key in all_keys:
-                    if 'embedding.weight' in key and 'vector_quantizer' in key:
-                        if key.startswith('state_dict.'):
-                            lidar_embedding_weight = lidar_checkpoint['state_dict'][key[11:]]
-                        else:
-                            lidar_embedding_weight = lidar_checkpoint[key]
-                        log(f"Found lidar embedding weight with key: {key}")
-                        break
-            
-            if lidar_embedding_weight is None:
-                log("Warning: Could not find lidar embedding weight. Using random initialization.")
-                lidar_embedding_weight = torch.randn(H.lidar_config.model.codebook_size, H.lidar_config.model.emb_dim)
-            
+        lidar_embedding_weight = full_lidar.vector_quantizer.embedding.weight
+        log(f"Extracted embedding weight shape: {lidar_embedding_weight.shape}")
     except Exception as e:
-        log(f"Error loading lidar embedding weight: {e}")
+        log(f"Error extracting embedding weight: {e}")
         log("Using random initialization for embedding weight.")
         lidar_embedding_weight = torch.randn(H.lidar_config.model.codebook_size, H.lidar_config.model.emb_dim)
     

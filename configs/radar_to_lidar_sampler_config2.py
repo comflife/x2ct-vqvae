@@ -31,7 +31,7 @@ def get_config():
     # NuScenes 데이터 경로
     data.data_root = "/data1/nuScenes/"  # NuScenes 데이터 루트 경로
     data.data_dir = "/data1/nuScenes/"  # 호환성을 위한 별칭
-    data.img_size = FieldReference(320)  # 메모리와 성능의 균형을 위해 320x320 사용
+    data.img_size = FieldReference(320)  # 메모리와 성능의 균형을 위해 320x320 사용 (Note: UltraLiDAR uses 640 internally; sync if needed)
     data.num_radar_views = 1  # radar는 단일 뷰
     data.channels = 1  # Radar BEV 채널 수
     data.load_res = None
@@ -39,12 +39,12 @@ def get_config():
     data.cupy = False
     data.use_synthetic = False
     data.loader = "nuscenes_radar_lidar"  # NuScenes radar+lidar 데이터로더 사용
-    # Radar-specific ann files (tiny 버전 사용)
-    data.radar_train_ann_file = "nuscenes_infos_train_radar.pkl"  # 우선 작은 데이터로 테스트
+    # Radar-specific ann files
+    data.radar_train_ann_file = "nuscenes_infos_train_radar.pkl"
     data.radar_val_ann_file = "nuscenes_infos_val_radar.pkl"
     # Lidar-specific ann files (standard NuScenes pkls for lidar)
-    data.lidar_train_ann_file = "nuscenes_infos_lidar_train.pkl"  # Adjust to full if needed, e.g., "nuscenes_infos_train.pkl"
-    data.lidar_val_ann_file = "nuscenes_infos_lidar_val.pkl"    # Adjust to full if needed, e.g., "nuscenes_infos_val.pkl"
+    data.lidar_train_ann_file = "nuscenes_infos_lidar_train.pkl"  # Standard full dataset for lidar
+    data.lidar_val_ann_file = "nuscenes_infos_lidar_val.pkl"      # Standard full dataset for lidar
 
     #######################################################################
     ########################### TRAINING CONFIG ###########################
