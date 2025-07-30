@@ -143,7 +143,7 @@ def extract_points_from_data(data, H=None):
         if not isinstance(points, torch.Tensor):
             points = torch.tensor(points, dtype=torch.float32)
             
-        log(f"[extract_points_from_data] Successfully extracted points from 'points' key, shape: {points.shape}")
+        # log(f"[extract_points_from_data] Successfully extracted points from 'points' key, shape: {points.shape}")
         return points
     
     # fallback: pts_filename이 있으면 파일에서 직접 로드
@@ -155,8 +155,8 @@ def extract_points_from_data(data, H=None):
         else:
             data_root = '/data1/nuScenes/'  # fallback
             
-        log(f"[extract_points_from_data] data_root: {data_root}")
-        log(f"[extract_points_from_data] pts_filename(raw): {pts_filename}")
+        # log(f"[extract_points_from_data] data_root: {data_root}")
+        # log(f"[extract_points_from_data] pts_filename(raw): {pts_filename}")
         
         # '/'로 시작하지 않으면 무조건 prepend
         if not str(pts_filename).startswith('/'):
@@ -164,7 +164,7 @@ def extract_points_from_data(data, H=None):
         else:
             pts_filename_full = pts_filename
             
-        log(f"[extract_points_from_data] Try loading: {pts_filename_full}")
+        # log(f"[extract_points_from_data] Try loading: {pts_filename_full}")
         
         # 파일을 직접 읽어서 points로 변환
         if os.path.exists(pts_filename_full):
@@ -175,23 +175,23 @@ def extract_points_from_data(data, H=None):
             elif len(points) % 6 == 0:  # lidar points: x, y, z, intensity, ring, time
                 points = points.reshape(-1, 6)
             points = torch.tensor(points, dtype=torch.float32)
-            log(f"[extract_points_from_data] Successfully loaded from file, shape: {points.shape}")
+            # log(f"[extract_points_from_data] Successfully loaded from file, shape: {points.shape}")
             return points
         else:
-            log(f"[extract_points_from_data] File not found: {pts_filename_full}")
+            # log(f"[extract_points_from_data] File not found: {pts_filename_full}")
             return None
     
-    log(f"[extract_points_from_data] No valid points data found in keys: {data.keys()}")
+    # log(f"[extract_points_from_data] No valid points data found in keys: {data.keys()}")
     return None
 
-def points_to_bev(points, bev_size=320, range_limit=50.0):
-    """Points를 BEV 이미지로 변환 (radar 시각화 코드와 동일한 방식)"""
+def points_to_bev(points, bev_size=640, range_limit=50.0):
+    """Points를 height bin을 고려한 multi-channel BEV 이미지로 변환"""
     if points.dim() == 3:
-        points = points[0]  # (N, 6)
+        points = points[0]  # (N, D)
     
     points_np = points.cpu().numpy()
     
-    # bev_size가 리스트인 경우 처리
+    # BEV 크기 설정
     if isinstance(bev_size, (list, tuple)):
         if len(bev_size) == 2:
             bev_h, bev_w = bev_size
@@ -200,43 +200,64 @@ def points_to_bev(points, bev_size=320, range_limit=50.0):
     else:
         bev_h = bev_w = bev_size
     
-    # BEV 이미지 생성
-    bev_image = np.zeros((bev_h, bev_w), dtype=np.float32)
+    # Height bin 설정 (UltraLiDAR/nuScenes 표준)
+    z_min = -5.0
+    z_max = 3.0
+    num_bins = 40
+    z_bin_size = (z_max - z_min) / num_bins
     
-    # 좌표 변환: [-50, 50] → [0, bev_size]
+    # Multi-channel BEV 이미지 생성: (num_bins, bev_h, bev_w)
+    bev_image = np.zeros((num_bins, bev_h, bev_w), dtype=np.float32)
+    
+    # 좌표 추출
     x_coords = points_np[:, 0]
     y_coords = points_np[:, 1]
+    z_coords = points_np[:, 2]
     
-    # RCS 값 또는 intensity 값 사용
+    # Intensity/RCS 값 (radar: RCS at [:,3]? 확인 필요; lidar: intensity at [:,3])
     if points_np.shape[1] >= 4:
-        intensity_values = points_np[:, 3]  # RCS 값
+        values = points_np[:, 3]  # RCS 또는 intensity
     else:
-        intensity_values = np.ones(len(points_np))  # 기본값
+        values = np.ones(len(points_np))  # 기본값
     
-    # 범위 내 점들만 선택
-    valid_mask = (np.abs(x_coords) <= range_limit) & (np.abs(y_coords) <= range_limit)
+    # 범위 내 점들만 선택 (x,y,z 모두)
+    valid_mask = (
+        (np.abs(x_coords) <= range_limit) &
+        (np.abs(y_coords) <= range_limit) &
+        (z_coords >= z_min) &
+        (z_coords < z_max)
+    )
     x_coords = x_coords[valid_mask]
     y_coords = y_coords[valid_mask]
-    intensity_values = intensity_values[valid_mask]
+    z_coords = z_coords[valid_mask]
+    values = values[valid_mask]
     
     if len(x_coords) == 0:
-        return torch.tensor(bev_image).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        return torch.tensor(bev_image).unsqueeze(0)  # (1, 40, H, W)
     
-    # 픽셀 좌표로 변환
+    # 픽셀 좌표 변환: [-range_limit, range_limit] → [0, bev_size]
     x_pixels = ((x_coords + range_limit) / (2 * range_limit) * bev_w).astype(int)
     y_pixels = ((y_coords + range_limit) / (2 * range_limit) * bev_h).astype(int)
     
+    # Height bin 계산
+    z_bins = ((z_coords - z_min) / z_bin_size).astype(int)
+    
     # 범위 체크
-    valid_pixels = (x_pixels >= 0) & (x_pixels < bev_w) & (y_pixels >= 0) & (y_pixels < bev_h)
+    valid_pixels = (
+        (x_pixels >= 0) & (x_pixels < bev_w) &
+        (y_pixels >= 0) & (y_pixels < bev_h) &
+        (z_bins >= 0) & (z_bins < num_bins)
+    )
     x_pixels = x_pixels[valid_pixels]
     y_pixels = y_pixels[valid_pixels]
-    intensity_values = intensity_values[valid_pixels]
+    z_bins = z_bins[valid_pixels]
+    values = values[valid_pixels]
     
-    # BEV에 값 할당 (같은 픽셀에 여러 점이 있으면 최대값 사용)
-    for x_pix, y_pix, intensity in zip(x_pixels, y_pixels, intensity_values):
-        bev_image[y_pix, x_pix] = max(bev_image[y_pix, x_pix], intensity)
+    # BEV에 값 할당 (같은 voxel에 여러 점이 있으면 max 사용; binary occupancy를 위해 1.0으로 설정 가능)
+    for z_bin, y_pix, x_pix, value in zip(z_bins, y_pixels, x_pixels, values):
+        bev_image[z_bin, y_pix, x_pix] = max(bev_image[z_bin, y_pix, x_pix], value)  # 또는 1.0으로 binary
     
-    return torch.tensor(bev_image).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    return torch.tensor(bev_image).unsqueeze(0)  # (1, 40, H, W)
 
 def load_dataset_mmdet3d(config_path, data_root, ann_file, train_mode=True):
     """mmdet3d 방식으로 데이터셋 로드 (원본 points)"""
@@ -281,59 +302,63 @@ def generate_latent_ids(H, ae_radar, ae_lidar, train_radar_dataset, train_lidar_
     log_gpu_memory()
     
     def generate_latents_from_dataset(radar_dataset, lidar_dataset, split_name):
-        latent_ids = []
         num_samples = min(len(radar_dataset), len(lidar_dataset))
         log(f"Processing {split_name} dataset with {num_samples} samples")
+        
+        latent_ids = []
+        chunk_size = 1000  # Adjust based on your RAM; e.g., 1000 samples ~13GB temp usage
+        chunk_idx = 0
+        os.makedirs(f'logs/{H.run.name}_{H.run.experiment}/{split_name}_latents_chunks', exist_ok=True)
+        
         for i in tqdm(range(num_samples), desc=f"Processing {split_name}"):
             radar_data = radar_dataset[i]
             lidar_data = lidar_dataset[i]
             
-            # Radar points 추출 및 BEV 변환
             radar_points = extract_points_from_data(radar_data, H)
             if radar_points is None:
-                log(f"Warning: No radar points in sample {i}")
                 continue
-            radar_bev = points_to_bev(radar_points, H.radar_config.data.img_size).to(device)
-            log(f"Processed radar sample {i}: BEV shape {radar_bev.shape}")
+            radar_bev = points_to_bev(radar_points, bev_size=640).to(device)
             
-            # Lidar points 추출 및 BEV 변환
             lidar_points = extract_points_from_data(lidar_data, H)
             if lidar_points is None:
-                log(f"Warning: No lidar points in sample {i}")
                 continue
-            lidar_bev = points_to_bev(lidar_points, H.lidar_config.data.img_size).to(device)
-            log(f"Processed lidar sample {i}: BEV shape {lidar_bev.shape}")
+            lidar_bev = points_to_bev(lidar_points, bev_size=640).to(device)
             
-            B = 1  # single sample
+            B = 1
             
-            # Radar BEV 인코딩 (UltraLiDAR wrapper 사용)
-            radar_latents = ae_radar.encoder(radar_bev)
-            radar_quant, _, _ = ae_radar.quantize(radar_latents)
+            radar_latents = ae_radar.lidar_encoder(radar_bev)
+            radar_quant, _, radar_indices = ae_radar.vector_quantizer(radar_latents)
             
-            # 올바른 reshape: (B, C, H, W) -> (B, H*W, C)
-            _, C, H_r, W_r = radar_quant.shape
-            radar_quant = radar_quant.permute(0, 2, 3, 1).contiguous().view(B, H_r*W_r, C)  # (B, seq_len=H*W, emb_dim=C)
-            
-            # Lidar BEV 인코딩 (UltraLiDAR wrapper 사용)
-            lidar_latents = ae_lidar.encoder(lidar_bev)
-            _, _, lidar_quant_stats = ae_lidar.quantize(lidar_latents)
-            lidar_min_encoding_indices = lidar_quant_stats["min_encoding_indices"]
-            lidar_min_encoding_indices = lidar_min_encoding_indices.view(B, -1)
+            lidar_latents = ae_lidar.lidar_encoder(lidar_bev)
+            lidar_quant, _, lidar_indices = ae_lidar.vector_quantizer(lidar_latents)
+            lidar_min_encoding_indices = lidar_indices.view(B, -1)
             
             latent_ids.append({
-                "radar_embed": radar_quant.cpu().contiguous(),  # (B, seq_len, emb_dim)
-                "lidar_codes": lidar_min_encoding_indices.cpu().contiguous()  # (B, seq_len)
+                "radar_embed": radar_quant.cpu().contiguous(),
+                "lidar_codes": lidar_min_encoding_indices.cpu().contiguous()
             })
+            
+            # Save chunk if reached size
+            if len(latent_ids) >= chunk_size or i == num_samples - 1:
+                chunk_path = f'logs/{H.run.name}_{H.run.experiment}/{split_name}_latents_chunks/chunk_{chunk_idx}.pt'
+                torch.save(latent_ids, chunk_path)
+                log(f"Saved chunk {chunk_idx} with {len(latent_ids)} samples to {chunk_path}")
+                latent_ids = []  # Clear to free memory
+                chunk_idx += 1
+                torch.cuda.empty_cache()  # Free GPU mem if needed
         
-        return latent_ids
+        # Later, you can load and merge chunks if needed for get_latent_loaders
+        return chunk_idx  # Return number of chunks for reference
     
-    train_latent_ids = generate_latents_from_dataset(train_radar_dataset, train_lidar_dataset, "train")
-    test_latent_ids = generate_latents_from_dataset(test_radar_dataset, test_lidar_dataset, "test")
+    train_chunks = generate_latents_from_dataset(train_radar_dataset, train_lidar_dataset, "train")
+    test_chunks = generate_latents_from_dataset(test_radar_dataset, test_lidar_dataset, "test")
+    
+    log("Latent codes generation completed. Chunks saved; modify get_latent_loaders to load from chunks.")
     
     # 잠재 코드 저장
     os.makedirs(f'logs/{H.run.name}_{H.run.experiment}', exist_ok=True)
-    torch.save(train_latent_ids, f'logs/{H.run.name}_{H.run.experiment}/train_latents')
-    torch.save(test_latent_ids, f'logs/{H.run.name}_{H.run.experiment}/val_latents')
+    torch.save(train_chunks, f'logs/{H.run.name}_{H.run.experiment}/train_latents')
+    torch.save(test_chunks, f'logs/{H.run.name}_{H.run.experiment}/val_latents')
     
     log("Latent codes generation completed")
 
