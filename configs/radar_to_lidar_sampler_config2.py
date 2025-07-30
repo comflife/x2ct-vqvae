@@ -21,7 +21,7 @@ def get_config():
     run.visdom_port = 8097
     run.log_to_file = False
     # GPU 설정
-    run.gpu_id = 1  # 사용할 GPU 번호 (0,1,2,3 중 선택)
+    run.gpu_id = 0  # 사용할 GPU 번호 (0,1,2,3 중 선택)
     run.use_cuda = True
 
     #######################################################################
@@ -31,7 +31,7 @@ def get_config():
     # NuScenes 데이터 경로
     data.data_root = "/data1/nuScenes/"  # NuScenes 데이터 루트 경로
     data.data_dir = "/data1/nuScenes/"  # 호환성을 위한 별칭
-    data.img_size = FieldReference(320)  # 메모리와 성능의 균형을 위해 320x320 사용 (Note: UltraLiDAR uses 640 internally; sync if needed)
+    data.img_size = FieldReference(640)  # 메모리와 성능의 균형을 위해 320x320 사용 (Note: UltraLiDAR uses 640 internally; sync if needed)
     data.num_radar_views = 1  # radar는 단일 뷰
     data.channels = 1  # Radar BEV 채널 수
     data.load_res = None
@@ -77,14 +77,14 @@ def get_config():
     # Name of architecture. Currently in ['absorbing', 'autoregressive'].
     model.name = "absorbing"
     # Network width
-    model.n_emb = 512
+    model.n_emb = 256 #512
     # Number of attention heads
-    model.n_head = 8
+    model.n_head = 4 #8
     # Number of layers
-    model.n_layers = 12
+    model.n_layers = 6 #12
     # Max input size to initialise positional embeddings etc at
     # 320x320 BEV: Radar context (1600) + Lidar target (1600) = 3200 토큰
-    model.block_size = 4096  # 여유를 위해 4096으로 설정
+    model.block_size = 16384
     # Dropout params
     model.attn_pdrop = 0.1
     model.embd_pdrop = 0.1

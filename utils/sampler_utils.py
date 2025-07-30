@@ -4,7 +4,7 @@ from einops import rearrange
 from tqdm import tqdm
 from .log_utils import save_latents, log
 from models import Transformer, AbsorbingDiffusion, AutoregressiveTransformer
-
+from torch.utils.data import Dataset, DataLoader  # Add this import if not already present
 
 def get_sampler(H, embedding_weight):
     if H.model.name == 'absorbing':
@@ -105,16 +105,76 @@ def generate_latents_from_loader(H, ae_ct, ae_xray, dataloader):
     return latent_ids
 
 
+class ChunkedLatentDataset(Dataset):
+    """Custom Dataset to load latents on-demand from chunk files"""
+    def __init__(self, chunk_dir):
+        self.chunk_dir = chunk_dir
+        self.chunk_files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.pt')])
+        self.cumulative_sizes = [0]
+        self.total_samples = 0
+        
+        # Precompute sample counts per chunk (without loading full chunks)
+        for chunk_file in self.chunk_files:
+            chunk_path = os.path.join(self.chunk_dir, chunk_file)
+            chunk = torch.load(chunk_path)  # Load briefly to get len
+            self.total_samples += len(chunk)
+            self.cumulative_sizes.append(self.total_samples)
+    
+    def __len__(self):
+        return self.total_samples
+    
+    def __getitem__(self, idx):
+        # Find which chunk the idx belongs to
+        for chunk_idx, cum_size in enumerate(self.cumulative_sizes):
+            if idx < cum_size:
+                break
+        chunk_idx -= 1  # Adjust to 0-based index
+        
+        # Load only the relevant chunk
+        chunk_path = os.path.join(self.chunk_dir, self.chunk_files[chunk_idx])
+        chunk = torch.load(chunk_path)
+        
+        # Get local index within the chunk
+        local_idx = idx - self.cumulative_sizes[chunk_idx]
+        return chunk[local_idx]  # Returns dict: {"radar_embed": tensor, "lidar_codes": tensor}
+
+
+# @torch.no_grad()
+# def get_latent_loaders(H, shuffle=True):
+#     train_latents_fp = f'logs/{H.run.name}_{H.run.experiment}/train_latents'
+#     val_latents_fp = f'logs/{H.run.name}_{H.run.experiment}/val_latents'
+
+#     train_latent_ids = torch.load(train_latents_fp)
+#     train_latent_loader = torch.utils.data.DataLoader(train_latent_ids, batch_size=H.train.batch_size, shuffle=shuffle)
+
+#     val_latent_ids = torch.load(val_latents_fp)
+#     val_latent_loader = torch.utils.data.DataLoader(val_latent_ids, batch_size=H.train.batch_size, shuffle=shuffle)
+
+#     return train_latent_loader, val_latent_loader
+
 @torch.no_grad()
 def get_latent_loaders(H, shuffle=True):
-    train_latents_fp = f'logs/{H.run.name}_{H.run.experiment}/train_latents'
-    val_latents_fp = f'logs/{H.run.name}_{H.run.experiment}/val_latents'
+    # Train chunks
+    train_chunk_dir = f'logs/{H.run.name}_{H.run.experiment}/train_latents_chunks'
+    train_dataset = ChunkedLatentDataset(train_chunk_dir)
+    train_latent_loader = DataLoader(
+        train_dataset,
+        batch_size=H.train.batch_size,
+        shuffle=shuffle,
+        num_workers=4,  # Adjust based on CPU cores; use 0 if I/O issues
+        pin_memory=True
+    )
 
-    train_latent_ids = torch.load(train_latents_fp)
-    train_latent_loader = torch.utils.data.DataLoader(train_latent_ids, batch_size=H.train.batch_size, shuffle=shuffle)
-
-    val_latent_ids = torch.load(val_latents_fp)
-    val_latent_loader = torch.utils.data.DataLoader(val_latent_ids, batch_size=H.train.batch_size, shuffle=shuffle)
+    # Val chunks (assuming "test" or "val" – match your generate_latents_from_dataset split_name)
+    val_chunk_dir = f'logs/{H.run.name}_{H.run.experiment}/test_latents_chunks'  # Or 'val_latents_chunks' if you used "val"
+    val_dataset = ChunkedLatentDataset(val_chunk_dir)
+    val_latent_loader = DataLoader(
+        val_dataset,
+        batch_size=H.train.batch_size,
+        shuffle=shuffle,
+        num_workers=4,
+        pin_memory=True
+    )
 
     return train_latent_loader, val_latent_loader
 
