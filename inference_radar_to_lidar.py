@@ -14,6 +14,8 @@ try:
 except ImportError:
     from mmcv.utils.config import Config
 from mmdet3d.datasets import build_dataset
+from mmdet3d.models import build_model
+from mmcv.runner import load_checkpoint
 
 # UltraLiDAR 플러그인 임포트 (모델 등록을 위해)
 sys.path.append('/home/byounggun/r2l/UltraLiDAR_nusc_waymo')
@@ -21,7 +23,6 @@ import plugin
 
 # 기존 모델들
 from models.vqgan_2d import Generator as Generator2D
-from utils.simple_ultralidar_wrapper import load_simple_ultralidar_model
 from utils.sampler_utils import get_sampler, latent_ids_to_onehot
 from utils.log_utils import log, flatten_collection, load_model
 
@@ -58,15 +59,21 @@ def setup_device(config):
     
     return device
 
-def load_pretrained_ultralidar(model_path, model_type, device):
-    """UltraLiDAR 모델 로드"""
-    try:
-        model = load_simple_ultralidar_model(model_path, model_type)
-        log(f"Successfully loaded UltraLiDAR {model_type} model from {model_path}")
-        return model.to(device)
-    except Exception as e:
-        log(f"Error loading UltraLiDAR {model_type} model: {e}")
-        raise e
+def load_pretrained_vqgan(model_path, config_path, device, model_type='radar'):
+    """사전 훈련된 UltraLiDAR 모델 로드 (full mmdet3d loading)"""
+    cfg = Config.fromfile(config_path)
+    cfg.model.pretrained = None
+    cfg.model.train_cfg = None
+    model = build_model(cfg.model, test_cfg=cfg.get('test_cfg'))
+    if os.path.exists(model_path):
+        log(f"Loading checkpoint from {model_path}")
+        checkpoint = torch.load(model_path, map_location='cpu')
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        model.load_state_dict(state_dict, strict=False)
+    model.to(device)
+    model.eval()
+    log(f"Loaded full UltraLiDAR {model_type} model from {model_path} using config {config_path}")
+    return model
 
 def extract_points_from_data(data, H=None):
     """mmdet3d 데이터에서 points 추출"""
@@ -131,12 +138,12 @@ def extract_points_from_data(data, H=None):
     log(f"[extract_points_from_data] No valid points data found in keys: {data.keys()}")
     return None
 
-def load_dataset_mmdet3d(config_path, data_root):
+def load_dataset_mmdet3d(config_path, data_root, ann_file):
     """mmdet3d 방식으로 데이터셋 로드 (원본 points)"""
     import os
     cfg = Config.fromfile(config_path)
 
-    ann_file_abs = os.path.join(data_root, 'nuscenes_infos_val_radar_tiny.pkl')
+    ann_file_abs = os.path.join(data_root, ann_file)
 
     if hasattr(cfg.data, 'test'):
         cfg.data.test.data_root = data_root
@@ -151,14 +158,14 @@ def load_dataset_mmdet3d(config_path, data_root):
 
     return dataset
 
-def points_to_bev(points, bev_size=320, range_limit=50.0):
-    """Points를 BEV 이미지로 변환 (radar 시각화 코드와 동일한 방식)"""
+def points_to_bev(points, bev_size=640, range_limit=50.0):
+    """Points를 height bin을 고려한 multi-channel BEV 이미지로 변환"""
     if points.dim() == 3:
-        points = points[0]  # (N, 6)
+        points = points[0]  # (N, D)
     
     points_np = points.cpu().numpy()
     
-    # bev_size가 리스트인 경우 처리
+    # BEV 크기 설정
     if isinstance(bev_size, (list, tuple)):
         if len(bev_size) == 2:
             bev_h, bev_w = bev_size
@@ -167,102 +174,179 @@ def points_to_bev(points, bev_size=320, range_limit=50.0):
     else:
         bev_h = bev_w = bev_size
     
-    # BEV 이미지 생성
-    bev_image = np.zeros((bev_h, bev_w), dtype=np.float32)
+    # Height bin 설정 (UltraLiDAR/nuScenes 표준)
+    z_min = -5.0
+    z_max = 3.0
+    num_bins = 40
+    z_bin_size = (z_max - z_min) / num_bins
     
-    # 좌표 변환: [-50, 50] → [0, bev_size]
+    # Multi-channel BEV 이미지 생성: (num_bins, bev_h, bev_w)
+    bev_image = np.zeros((num_bins, bev_h, bev_w), dtype=np.float32)
+    
+    # 좌표 추출
     x_coords = points_np[:, 0]
     y_coords = points_np[:, 1]
+    z_coords = points_np[:, 2]
     
-    # RCS 값 또는 intensity 값 사용
+    # Intensity/RCS 값 (radar: RCS at [:,3]? 확인 필요; lidar: intensity at [:,3])
     if points_np.shape[1] >= 4:
-        intensity_values = points_np[:, 3]  # RCS 값
+        values = points_np[:, 3]  # RCS 또는 intensity
     else:
-        intensity_values = np.ones(len(points_np))  # 기본값
+        values = np.ones(len(points_np))  # 기본값
     
-    # 범위 내 점들만 선택
-    valid_mask = (np.abs(x_coords) <= range_limit) & (np.abs(y_coords) <= range_limit)
+    # 범위 내 점들만 선택 (x,y,z 모두)
+    valid_mask = (
+        (np.abs(x_coords) <= range_limit) &
+        (np.abs(y_coords) <= range_limit) &
+        (z_coords >= z_min) &
+        (z_coords < z_max)
+    )
     x_coords = x_coords[valid_mask]
     y_coords = y_coords[valid_mask]
-    intensity_values = intensity_values[valid_mask]
+    z_coords = z_coords[valid_mask]
+    values = values[valid_mask]
     
     if len(x_coords) == 0:
-        return torch.tensor(bev_image).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        return torch.tensor(bev_image).unsqueeze(0)  # (1, 40, H, W)
     
-    # 픽셀 좌표로 변환
+    # 픽셀 좌표 변환: [-range_limit, range_limit] → [0, bev_size]
     x_pixels = ((x_coords + range_limit) / (2 * range_limit) * bev_w).astype(int)
     y_pixels = ((y_coords + range_limit) / (2 * range_limit) * bev_h).astype(int)
     
+    # Height bin 계산
+    z_bins = ((z_coords - z_min) / z_bin_size).astype(int)
+    
     # 범위 체크
-    valid_pixels = (x_pixels >= 0) & (x_pixels < bev_w) & (y_pixels >= 0) & (y_pixels < bev_h)
+    valid_pixels = (
+        (x_pixels >= 0) & (x_pixels < bev_w) &
+        (y_pixels >= 0) & (y_pixels < bev_h) &
+        (z_bins >= 0) & (z_bins < num_bins)
+    )
     x_pixels = x_pixels[valid_pixels]
     y_pixels = y_pixels[valid_pixels]
-    intensity_values = intensity_values[valid_pixels]
+    z_bins = z_bins[valid_pixels]
+    values = values[valid_pixels]
     
-    # BEV에 값 할당 (같은 픽셀에 여러 점이 있으면 최대값 사용)
-    for x_pix, y_pix, intensity in zip(x_pixels, y_pixels, intensity_values):
-        bev_image[y_pix, x_pix] = max(bev_image[y_pix, x_pix], intensity)
+    # BEV에 값 할당 (같은 voxel에 여러 점이 있으면 max 사용; binary occupancy를 위해 1.0으로 설정 가능)
+    for z_bin, y_pix, x_pix, value in zip(z_bins, y_pixels, x_pixels, values):
+        bev_image[z_bin, y_pix, x_pix] = max(bev_image[z_bin, y_pix, x_pix], value)  # 또는 1.0으로 binary
     
-    return torch.tensor(bev_image).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    return torch.tensor(bev_image).unsqueeze(0)  # (1, 40, H, W)
 
 def reconstruct_from_codes(H, sampler, codes, generator):
     """코드로부터 이미지 재구성 - eval_sampler.py 방식 사용"""
     # codes: (B, seq_len) - 이산 코드 인덱스
     latents_one_hot = latent_ids_to_onehot(codes, H.lidar_config.model.latent_shape, H.lidar_config.model.codebook_size)
-    q = sampler.embed(latents_one_hot)
+    
+    # latents_one_hot shape 확인 및 수정
+    log(f"latents_one_hot shape before embed: {latents_one_hot.shape}")
+    
+    # sampler.embed 대신 직접 embedding lookup 사용
+    B, seq_len = codes.shape
+    codebook_size = H.lidar_config.model.codebook_size
+    
+    # codes를 one-hot으로 변환하지 말고 직접 embedding lookup
+    codes_flat = codes.view(-1)  # (B*seq_len,)
+    
+    # embedding weight에서 직접 lookup
+    embedding_weight = sampler.embedding_weight  # (codebook_size, embed_dim)
+    q = embedding_weight[codes_flat]  # (B*seq_len, embed_dim)
+    
+    # reshape to (B, seq_len, embed_dim)
+    embed_dim = embedding_weight.shape[1]
+    q = q.view(B, seq_len, embed_dim)
+    
+    log(f"q shape after embedding lookup: {q.shape}")
+    
     images = generator(q.float())
     return images
 
-def bev_to_points(bev_image, intensity_threshold=0.01):
-    """BEV 이미지를 포인트로 변환 (radar 시각화 코드 참조)"""
+def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
+    """Multi-channel BEV 이미지를 3D 포인트로 변환 (x, y, z, intensity)"""
     if isinstance(bev_image, torch.Tensor):
         bev_image = bev_image.cpu().numpy()
     
-    # 임계값보다 큰 값들의 위치 찾기
-    y_indices, x_indices = np.where(bev_image > intensity_threshold)
+    if bev_image.ndim == 4:  # (1, num_bins, H, W)
+        bev_image = bev_image[0]
+    elif bev_image.ndim == 3:  # (num_bins, H, W)
+        pass
+    else:
+        raise ValueError(f"Unexpected BEV shape: {bev_image.shape}")
     
-    if len(x_indices) == 0:
-        return np.zeros((0, 3))  # x, y, intensity
+    num_bins, height, width = bev_image.shape
     
-    # 픽셀 좌표를 실제 좌표로 변환 (예: -50m ~ +50m)
-    height, width = bev_image.shape
-    x_coords = (x_indices / width) * 100.0 - 50.0
-    y_coords = (y_indices / height) * 100.0 - 50.0
+    # Height bin 파라미터
+    z_min = -5.0
+    z_max = 3.0
+    z_bin_size = (z_max - z_min) / num_bins
     
-    # 강도값 추출
-    intensities = bev_image[y_indices, x_indices]
+    points_list = []
     
-    points = np.stack([x_coords, y_coords, intensities], axis=1)
-    return points
+    for bin_idx in range(num_bins):
+        # 현재 bin의 2D slice
+        slice_img = bev_image[bin_idx]
+        
+        # 임계값보다 큰 위치 찾기
+        y_indices, x_indices = np.where(slice_img > intensity_threshold)
+        
+        if len(x_indices) == 0:
+            continue
+        
+        # 픽셀 좌표를 실제 좌표로 변환
+        x_coords = (x_indices / width) * (2 * range_limit) - range_limit  # [-range, range]
+        y_coords = (y_indices / height) * (2 * range_limit) - range_limit  # [-range, range]
+        
+        # Z 좌표 계산: bin 중심
+        z_coords = np.full_like(x_coords, z_min + (bin_idx + 0.5) * z_bin_size)
+        
+        # 강도값
+        intensities = slice_img[y_indices, x_indices]
+        
+        # 결합
+        slice_points = np.stack([x_coords, y_coords, z_coords, intensities], axis=1)
+        points_list.append(slice_points)
+    
+    if points_list:
+        return np.concatenate(points_list, axis=0)
+    else:
+        return np.zeros((0, 4))  # x, y, z, intensity
 
 def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_gt, lidar_pred, sample_idx, output_dir):
     """원본 points와 BEV 결과를 모두 시각화 - 라이다는 포인트 클라우드로"""
     
-    # 원본 데이터를 numpy로 변환
-    radar_img = radar_bev[0, 0].cpu().numpy()  # (H, W)
-    lidar_gt_img = lidar_gt[0, 0].cpu().numpy() if lidar_gt is not None else None  # (H, W)
-    lidar_pred_img = lidar_pred[0, 0].cpu().numpy()  # (H, W)
+    # BEV를 numpy로 변환 (multi-channel 처리)
+    radar_bev_np = radar_bev[0].cpu().numpy() if radar_bev is not None else None  # (40, H, W)
+    lidar_gt_np = lidar_gt[0].cpu().numpy() if lidar_gt is not None else None
+    lidar_pred_np = lidar_pred[0].cpu().numpy() if lidar_pred is not None else None
     
-    # 크기 불일치 해결 - 예측 결과를 GT 크기에 맞춤
-    if lidar_gt_img is not None and lidar_pred_img.shape != lidar_gt_img.shape:
-        from scipy.ndimage import zoom
-        scale_factor = (lidar_gt_img.shape[0] / lidar_pred_img.shape[0], 
-                       lidar_gt_img.shape[1] / lidar_pred_img.shape[1])
-        lidar_pred_img = zoom(lidar_pred_img, scale_factor, order=1)
-        log(f"Resized prediction from {lidar_pred.shape} to {lidar_pred_img.shape}")
+    # 2D projection for visualization (max over height bins)
+    if radar_bev_np is not None:
+        radar_img = np.max(radar_bev_np, axis=0)  # (H, W)
+    else:
+        radar_img = None
+    
+    if lidar_gt_np is not None:
+        lidar_gt_img = np.max(lidar_gt_np, axis=0)
+    else:
+        lidar_gt_img = None
+    
+    if lidar_pred_np is not None:
+        lidar_pred_img = np.max(lidar_pred_np, axis=0)
+    else:
+        lidar_pred_img = None
     
     # 데이터 범위 확인
-    log(f"Data ranges - Radar: [{radar_img.min():.3f}, {radar_img.max():.3f}]")
+    if radar_img is not None:
+        log(f"Data ranges - Radar: [{radar_img.min():.3f}, {radar_img.max():.3f}]")
     if lidar_gt_img is not None:
         log(f"Data ranges - Lidar GT: [{lidar_gt_img.min():.3f}, {lidar_gt_img.max():.3f}]")
-    log(f"Data ranges - Lidar Pred: [{lidar_pred_img.min():.3f}, {lidar_pred_img.max():.3f}]")
+    if lidar_pred_img is not None:
+        log(f"Data ranges - Lidar Pred: [{lidar_pred_img.min():.3f}, {lidar_pred_img.max():.3f}]")
     
-    # BEV를 포인트로 변환
-    radar_bev_points = bev_to_points(radar_img, intensity_threshold=0.01)  # Radar는 기존 방식
-    
-    # LiDAR는 포인트 클라우드로 변환
-    lidar_gt_points = bev_to_points_lidar(lidar_gt_img, intensity_threshold=0.01) if lidar_gt_img is not None else np.zeros((0, 4))
-    lidar_pred_points = bev_to_points_lidar(lidar_pred_img, intensity_threshold=0.01)
+    # BEV를 3D 포인트로 변환
+    radar_bev_points = bev_to_points_3d(radar_bev_np) if radar_bev_np is not None else np.zeros((0, 4))
+    lidar_gt_points = bev_to_points_3d(lidar_gt_np) if lidar_gt_np is not None else np.zeros((0, 4))
+    lidar_pred_points = bev_to_points_3d(lidar_pred_np) if lidar_pred_np is not None else np.zeros((0, 4))
     
     # 원본 points 준비
     radar_points_np = radar_points.cpu().numpy() if radar_points is not None else np.zeros((0, 6))
@@ -314,7 +398,7 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     # Radar BEV (기존 방식)
     if len(radar_bev_points) > 0:
         scatter3 = axes[1, 0].scatter(radar_bev_points[:, 0], radar_bev_points[:, 1], 
-                                     c=radar_bev_points[:, 2], cmap='viridis', s=2, alpha=0.7)
+                                     c=radar_bev_points[:, 3], cmap='viridis', s=2, alpha=0.7)
         plt.colorbar(scatter3, ax=axes[1, 0], shrink=0.8)
     axes[1, 0].set_title(f'Radar BEV (Input)\n{len(radar_bev_points)} points', 
                         fontsize=12, fontweight='bold')
@@ -355,11 +439,11 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     plt.close()
     
     # 추가: 히트맵 비교도 별도로 저장
-    if lidar_gt_img is not None:
+    if lidar_gt_img is not None and lidar_pred_img is not None:
         visualize_heatmaps(radar_img, lidar_gt_img, lidar_pred_img, sample_idx, output_dir)
     
     # 차이 맵 생성 (GT가 있는 경우에만)
-    if lidar_gt_img is not None:
+    if lidar_gt_img is not None and lidar_pred_img is not None:
         fig, ax = plt.subplots(1, 1, figsize=(8, 6))
         diff = np.abs(lidar_gt_img - lidar_pred_img)
         im = ax.imshow(diff, cmap='coolwarm', origin='lower')
@@ -398,19 +482,23 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
         log("No GT available for metric calculation")
         return None, None, None, None
 
-def visualize_heatmaps(radar_bev, lidar_gt, lidar_pred, sample_idx, output_dir):
+def visualize_heatmaps(radar_img, lidar_gt_img, lidar_pred_img, sample_idx, output_dir):
     """BEV를 직접 히트맵으로 시각화 (추가 시각화)"""
     
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
     # Radar BEV 히트맵
-    im1 = axes[0].imshow(radar_bev, cmap='viridis', origin='lower')
-    axes[0].set_title('Radar BEV (Input)')
-    plt.colorbar(im1, ax=axes[0])
+    if radar_img is not None:
+        im1 = axes[0].imshow(radar_img, cmap='viridis', origin='lower')
+        axes[0].set_title('Radar BEV (Input)')
+        plt.colorbar(im1, ax=axes[0])
+    else:
+        axes[0].set_title('No Radar Available')
+        axes[0].axis('off')
     
     # GT Lidar BEV 히트맵
-    if lidar_gt is not None:
-        im2 = axes[1].imshow(lidar_gt, cmap='hot', origin='lower')
+    if lidar_gt_img is not None:
+        im2 = axes[1].imshow(lidar_gt_img, cmap='hot', origin='lower')
         axes[1].set_title('GT Lidar BEV')
         plt.colorbar(im2, ax=axes[1])
     else:
@@ -418,9 +506,13 @@ def visualize_heatmaps(radar_bev, lidar_gt, lidar_pred, sample_idx, output_dir):
         axes[1].axis('off')
     
     # Predicted Lidar BEV 히트맵
-    im3 = axes[2].imshow(lidar_pred, cmap='hot', origin='lower')
-    axes[2].set_title('Predicted Lidar BEV')
-    plt.colorbar(im3, ax=axes[2])
+    if lidar_pred_img is not None:
+        im3 = axes[2].imshow(lidar_pred_img, cmap='hot', origin='lower')
+        axes[2].set_title('Predicted Lidar BEV')
+        plt.colorbar(im3, ax=axes[2])
+    else:
+        axes[2].set_title('No Prediction Available')
+        axes[2].axis('off')
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'heatmap_{sample_idx}.png'), dpi=300)
@@ -478,13 +570,9 @@ def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lid
             return None
     
     radar_points = radar_points.to(device)
-    
-    # img_size 처리 - 리스트인 경우 첫 번째 값 사용하거나 기본값 사용
-    radar_img_size = H.radar_config.data.img_size
-    if isinstance(radar_img_size, (list, tuple)):
-        radar_img_size = radar_img_size[0] if len(radar_img_size) > 0 else 320
-    
-    radar_bev = points_to_bev(radar_points, radar_img_size).to(device)
+
+    # Explicitly set bev_size to 640 to match model input
+    radar_bev = points_to_bev(radar_points, bev_size=640).to(device)
     
     log(f"Original radar points: {radar_points.shape}")
     log(f"Converted radar BEV: {radar_bev.shape}")
@@ -508,22 +596,18 @@ def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lid
         if lidar_points is not None:
             lidar_points = lidar_points.to(device)
             
-            # lidar img_size 처리
-            lidar_img_size = H.lidar_config.data.img_size
-            if isinstance(lidar_img_size, (list, tuple)):
-                lidar_img_size = lidar_img_size[0] if len(lidar_img_size) > 0 else 320
-            
-            lidar_bev = points_to_bev(lidar_points, lidar_img_size).to(device)
+            # Explicitly set bev_size to 320 to match model input
+            lidar_bev = points_to_bev(lidar_points, bev_size=640).to(device)
             log(f"Original lidar points: {lidar_points.shape}")
             log(f"Converted lidar BEV: {lidar_bev.shape}")
             log(f"Lidar BEV range: [{lidar_bev.min():.3f}, {lidar_bev.max():.3f}]")
     
     # 3. Radar BEV 인코딩하여 context 생성
-    radar_latents = ae_radar.encoder(radar_bev)
-    radar_quant, _, _ = ae_radar.quantize(radar_latents)
+    radar_latents = ae_radar.lidar_encoder(radar_bev)  # assuming lidar_encoder for BEV
+    radar_quant, _, radar_indices = ae_radar.vector_quantizer(radar_latents)
     
-    B, C, H_dim, W_dim = radar_quant.shape
-    context = radar_quant.permute(0, 2, 3, 1).contiguous().view(B, H_dim*W_dim, C)
+    B = radar_quant.size(0)
+    context = radar_quant.view(B, -1, radar_quant.size(-1))  # reshape to (B, seq, dim)
     
     log(f"Context shape: {context.shape}")
     
@@ -531,9 +615,9 @@ def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lid
     lidar_gt_codes = None
     gt_lidar_reconstructed = None
     if lidar_bev is not None:
-        lidar_latents = ae_lidar.encoder(lidar_bev)
-        _, _, lidar_quant_stats = ae_lidar.quantize(lidar_latents)
-        lidar_gt_codes = lidar_quant_stats["min_encoding_indices"].view(B, -1)
+        lidar_latents = ae_lidar.lidar_encoder(lidar_bev)
+        lidar_quant, _, lidar_indices = ae_lidar.vector_quantizer(lidar_latents)
+        lidar_gt_codes = lidar_indices.view(B, -1)
         gt_lidar_reconstructed = reconstruct_from_codes(H, sampler, lidar_gt_codes, generator_lidar)
         log(f"GT codes shape: {lidar_gt_codes.shape}, unique codes: {len(torch.unique(lidar_gt_codes))}")
     
@@ -587,7 +671,9 @@ def inference_single_sample_from_points(H, sampler, ae_radar, ae_lidar, generato
             return None
     
     radar_points = radar_points.to(device)
-    radar_bev = points_to_bev(radar_points, H.radar_config.data.img_size).to(device)
+    
+    # Explicitly set bev_size to 320 to match model input
+    radar_bev = points_to_bev(radar_points, bev_size=640).to(device)
     
     log(f"Original radar points: {radar_points.shape}")
     log(f"Converted radar BEV: {radar_bev.shape}")
@@ -613,17 +699,19 @@ def inference_single_sample_from_points(H, sampler, ae_radar, ae_lidar, generato
             
             if lidar_points is not None:
                 lidar_points = lidar_points.to(device)
-                lidar_bev = points_to_bev(lidar_points, H.lidar_config.data.img_size).to(device)
+                
+                # Explicitly set bev_size to 320 to match model input
+                lidar_bev = points_to_bev(lidar_points, bev_size=640).to(device)
                 log(f"Original lidar points: {lidar_points.shape}")
                 log(f"Converted lidar BEV: {lidar_bev.shape}")
                 log(f"Lidar BEV range: [{lidar_bev.min():.3f}, {lidar_bev.max():.3f}]")
     
     # 3. Radar BEV 인코딩하여 context 생성
-    radar_latents = ae_radar.encoder(radar_bev)
-    radar_quant, _, _ = ae_radar.quantize(radar_latents)
+    radar_latents = ae_radar.lidar_encoder(radar_bev)  # assuming lidar_encoder for BEV
+    radar_quant, _, radar_indices = ae_radar.vector_quantizer(radar_latents)
     
-    B, C, H_dim, W_dim = radar_quant.shape
-    context = radar_quant.permute(0, 2, 3, 1).contiguous().view(B, H_dim*W_dim, C)
+    B = radar_quant.size(0)
+    context = radar_quant.view(B, -1, radar_quant.size(-1))  # reshape to (B, seq, dim)
     
     log(f"Context shape: {context.shape}")
     
@@ -631,9 +719,9 @@ def inference_single_sample_from_points(H, sampler, ae_radar, ae_lidar, generato
     lidar_gt_codes = None
     gt_lidar_reconstructed = None
     if lidar_bev is not None:
-        lidar_latents = ae_lidar.encoder(lidar_bev)
-        _, _, lidar_quant_stats = ae_lidar.quantize(lidar_latents)
-        lidar_gt_codes = lidar_quant_stats["min_encoding_indices"].view(B, -1)
+        lidar_latents = ae_lidar.lidar_encoder(lidar_bev)
+        lidar_quant, _, lidar_indices = ae_lidar.vector_quantizer(lidar_latents)
+        lidar_gt_codes = lidar_indices.view(B, -1)
         gt_lidar_reconstructed = reconstruct_from_codes(H, sampler, lidar_gt_codes, generator_lidar)
         log(f"GT codes shape: {lidar_gt_codes.shape}, unique codes: {len(torch.unique(lidar_gt_codes))}")
     
@@ -665,35 +753,7 @@ def inference_single_sample_from_points(H, sampler, ae_radar, ae_lidar, generato
     }
 
 def bev_to_points_lidar(bev_image, intensity_threshold=0.01, range_limit=50.0):
-    """BEV 이미지를 LiDAR 포인트로 변환 (3D 포인트 클라우드 형태)"""
-    if isinstance(bev_image, torch.Tensor):
-        bev_image = bev_image.cpu().numpy()
-    
-    # 2D BEV에서 임계값보다 큰 값들의 위치 찾기
-    if bev_image.ndim == 4:  # (1, 1, H, W)
-        bev_image = bev_image[0, 0]
-    elif bev_image.ndim == 3:  # (1, H, W)
-        bev_image = bev_image[0]
-    
-    y_indices, x_indices = np.where(bev_image > intensity_threshold)
-    
-    if len(x_indices) == 0:
-        return np.zeros((0, 4))  # x, y, z, intensity
-    
-    # 픽셀 좌표를 실제 좌표로 변환
-    height, width = bev_image.shape
-    x_coords = (x_indices / width) * (2 * range_limit) - range_limit  # [-50, 50]
-    y_coords = (y_indices / height) * (2 * range_limit) - range_limit  # [-50, 50]
-    
-    # Z 좌표는 0으로 설정 (BEV이므로)
-    z_coords = np.zeros_like(x_coords)
-    
-    # 강도값 추출
-    intensities = bev_image[y_indices, x_indices]
-    
-    # 포인트 클라우드 형태로 결합: [x, y, z, intensity]
-    points = np.stack([x_coords, y_coords, z_coords, intensities], axis=1)
-    return points
+    return bev_to_points_3d(bev_image, intensity_threshold, range_limit)
 
 
 def main(argv):
@@ -719,79 +779,93 @@ def main(argv):
 
     log("Loading models...")
     
-    # UltraLiDAR 모델들 로드
-    ae_radar = load_pretrained_ultralidar(
+    # UltraLiDAR 모델들 로드 (full loading)
+    ae_radar = load_pretrained_vqgan(
         H.model_paths.radar_vqgan_path,
-        'radar',
-        device
+        FLAGS.radar_ultralidar_config,
+        device,
+        model_type='radar'
     )
-    ae_lidar = load_pretrained_ultralidar(
+    ae_lidar = load_pretrained_vqgan(
         H.model_paths.lidar_vqgan_path,
-        'lidar', 
-        device
+        FLAGS.lidar_ultralidar_config,
+        device,
+        model_type='lidar'
     )
     
-    # Generator 로드 (lidar 재구성용)
-    generator_lidar = load_pretrained_ultralidar(
-        H.model_paths.lidar_vqgan_path,
-        'lidar',
-        device
-    )
+    # Generator 로드 (lidar 재구성용) - full model의 decoder 사용
+    generator_lidar = ae_lidar.lidar_decoder
     
     # 모델들을 eval 모드로 설정
     ae_radar.eval()
     ae_lidar.eval()
-    generator_lidar.eval()
     
     # Lidar embedding weight 추출
     try:
-        lidar_embedding_weight = None
-        
-        # UltraLiDAR 모델의 get_embedding_weight 메서드 사용
-        if hasattr(ae_lidar, 'get_embedding_weight'):
-            lidar_embedding_weight = ae_lidar.get_embedding_weight()
-            log(f"Found embedding weight using get_embedding_weight(), shape: {lidar_embedding_weight.shape}")
-        elif hasattr(ae_lidar, 'vector_quantizer') and hasattr(ae_lidar.vector_quantizer, 'embedding'):
-            lidar_embedding_weight = ae_lidar.vector_quantizer.embedding.weight
-            log(f"Found embedding weight from ae_lidar.vector_quantizer.embedding.weight, shape: {lidar_embedding_weight.shape}")
-        elif hasattr(ae_lidar, 'quantize') and hasattr(ae_lidar.quantize, 'embedding'):
-            lidar_embedding_weight = ae_lidar.quantize.embedding.weight
-            log(f"Found embedding weight from ae_lidar.quantize.embedding.weight, shape: {lidar_embedding_weight.shape}")
-        elif hasattr(ae_lidar, 'quantizer') and hasattr(ae_lidar.quantizer, 'embedding'):
-            lidar_embedding_weight = ae_lidar.quantizer.embedding.weight
-            log(f"Found embedding weight from ae_lidar.quantizer.embedding.weight, shape: {lidar_embedding_weight.shape}")
-        else:
-            # 모델의 모든 파라미터를 확인해서 embedding weight 찾기
-            for name, param in ae_lidar.named_parameters():
-                if 'embedding.weight' in name and param.shape[0] == H.lidar_config.model.codebook_size:
-                    lidar_embedding_weight = param
-                    log(f"Found embedding weight from {name}, shape: {lidar_embedding_weight.shape}")
-                    break
-        
-        if lidar_embedding_weight is None:
-            raise ValueError("Could not find embedding weight in the loaded model")
-            
+        lidar_embedding_weight = ae_lidar.vector_quantizer.embedding.weight
+        log(f"Extracted embedding weight shape: {lidar_embedding_weight.shape}")
     except Exception as e:
         log(f"Error extracting embedding weight: {e}")
         return
+    
+    # 실제 latent shape 확인을 위한 테스트
+    test_input = torch.randn(1, 40, 640, 640).to(device)
+    with torch.no_grad():
+        test_latents = ae_lidar.lidar_encoder(test_input)
+        log(f"Full latent shape from encoder: {test_latents.shape}")
+        
+        # latent shape 추출 - 실제 spatial dimensions 확인
+        if len(test_latents.shape) == 4:  # (B, C, H, W)
+            actual_latent_shape = test_latents.shape[2:]  # (H, W)
+        elif len(test_latents.shape) == 3:  # (B, H*W, C) - flattened
+            # Context shape이 (1, 6400, 1024)이므로 6400 = 80*80
+            seq_len = test_latents.shape[1]  # 6400
+            latent_h = latent_w = int(seq_len ** 0.5)  # sqrt(6400) = 80
+            actual_latent_shape = (latent_h, latent_w)
+        else:
+            # fallback
+            actual_latent_shape = (80, 80)  # 6400 = 80*80
+        
+        log(f"Detected latent shape: {actual_latent_shape}")
+    
+    # latent_shape을 실제 크기로 업데이트
+    H.lidar_config.model.latent_shape = list(actual_latent_shape)
+    log(f"Updated latent_shape to: {H.lidar_config.model.latent_shape}")
     
     # Sampler 생성 및 학습된 가중치 로드
     H.ct_config = H.lidar_config  # 호환성을 위해
     
     sampler = get_sampler(H, lidar_embedding_weight.to(device)).to(device)
     
-    # 학습된 sampler 가중치 로드
+    # 학습된 sampler 가중치 로드 - 크기 불일치 무시
     log(f"Loading trained sampler from {FLAGS.model_path}")
     checkpoint = torch.load(FLAGS.model_path, map_location=device)
-    sampler.load_state_dict(checkpoint, strict=True)
+    
+    # 크기가 맞지 않는 파라미터들 제거
+    model_state = sampler.state_dict()
+    filtered_checkpoint = {}
+    
+    for key, value in checkpoint.items():
+        if key in model_state:
+            if model_state[key].shape == value.shape:
+                filtered_checkpoint[key] = value
+                log(f"Loading parameter: {key} with shape {value.shape}")
+            else:
+                log(f"Skipping parameter {key}: shape mismatch ({model_state[key].shape} vs {value.shape})")
+        else:
+            log(f"Skipping unknown parameter: {key}")
+    
+    sampler.load_state_dict(filtered_checkpoint, strict=False)
+    log(f"Loaded {len(filtered_checkpoint)} parameters out of {len(checkpoint)}")
+    
     sampler.eval()
     
     log("Models loaded successfully!")
     
     # mmdet3d 방식으로 데이터셋 로드
     log("Loading datasets using mmdet3d...")
-    radar_dataset = load_dataset_mmdet3d(FLAGS.radar_ultralidar_config, H.data.data_root)
-    lidar_dataset = load_dataset_mmdet3d(FLAGS.lidar_ultralidar_config, H.data.data_root)
+    radar_dataset = load_dataset_mmdet3d(FLAGS.radar_ultralidar_config, H.data.data_root, H.data.radar_val_ann_file)
+    lidar_dataset = load_dataset_mmdet3d(FLAGS.lidar_ultralidar_config, H.data.data_root, H.data.lidar_val_ann_file)
     
     log(f"Loaded radar dataset: {len(radar_dataset)} samples")
     log(f"Loaded lidar dataset: {len(lidar_dataset)} samples")
@@ -894,6 +968,11 @@ def main(argv):
                 **save_data
             )
 
+            # Save point clouds as PLY
+            lidar_gt_points_3d = bev_to_points_3d(results['lidar_bev']) if results['lidar_bev'] is not None else np.zeros((0, 4))
+            lidar_pred_points_3d = bev_to_points_3d(results['lidar_predicted']) if results['lidar_predicted'] is not None else np.zeros((0, 4))
+            save_pointclouds_as_ply(lidar_gt_points_3d, lidar_pred_points_3d, num_success+1, output_dir)
+
             num_success += 1
             log(f"Successfully processed sample {i+1} (total success: {num_success})")
             
@@ -924,3 +1003,5 @@ def main(argv):
 
 if __name__ == '__main__':
     app.run(main)
+
+

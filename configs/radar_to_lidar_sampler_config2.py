@@ -57,7 +57,7 @@ def get_config():
     # How often to plot reconstruction images
     train.plot_recon_steps = 500
     # How often to evaluate on test set
-    train.eval_steps = 5000
+    train.eval_steps = 10000
     # How often to save checkpoints
     train.checkpoint_steps = 5000
     # How often to update ema model params
@@ -66,7 +66,7 @@ def get_config():
     # What model step to load
     train.load_step = 0
     # Number of times to repeat evaluation
-    train.eval_repeats = 10
+    train.eval_repeats = 3
     train.use_context = True
     train.total_steps = 100000
 
