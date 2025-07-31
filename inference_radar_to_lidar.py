@@ -622,13 +622,53 @@ def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lid
         log(f"GT codes shape: {lidar_gt_codes.shape}, unique codes: {len(torch.unique(lidar_gt_codes))}")
     
     # 5. Sampler로 lidar codes 예측
+    # start_time = time.time()
+    # predicted_codes = sampler.sample(
+    #     context=context,
+    #     sample_steps=H.diffusion.sampling_steps,
+    #     temp=H.diffusion.sampling_temp
+    # )
+    # inference_time = time.time() - start_time
+        # 5. Sampler로 lidar codes 예측
     start_time = time.time()
-    predicted_codes = sampler.sample(
-        context=context,
-        sample_steps=H.diffusion.sampling_steps,
-        temp=H.diffusion.sampling_temp
-    )
+    
+    # 배치 크기 확인 및 디버깅
+    log(f"Before sampling - Context shape: {context.shape}")
+    log(f"Context batch size: {context.size(0)}")
+    
+    try:
+        predicted_codes = sampler.sample(
+            context=context,
+            sample_steps=H.diffusion.sampling_steps,
+            temp=H.diffusion.sampling_temp
+        )
+    except RuntimeError as e:
+        if "Sizes of tensors must match" in str(e):
+            log(f"Batch size mismatch error: {e}")
+            log("Trying to fix by ensuring consistent batch size...")
+            
+            # context를 복제하여 배치 크기를 맞춤
+            if context.size(0) == 1:
+                # 필요시 배치 크기를 2로 확장
+                context_expanded = context.repeat(2, 1, 1)
+                log(f"Expanded context shape: {context_expanded.shape}")
+                
+                predicted_codes = sampler.sample(
+                    context=context_expanded,
+                    sample_steps=H.diffusion.sampling_steps,
+                    temp=H.diffusion.sampling_temp
+                )
+                
+                # 첫 번째 결과만 사용
+                predicted_codes = predicted_codes[:1]
+            else:
+                raise e
+        else:
+            raise e
+    
     inference_time = time.time() - start_time
+    
+    log(f"Predicted codes shape: {predicted_codes.shape}, unique codes: {len(torch.unique(predicted_codes))}")
     
     log(f"Predicted codes shape: {predicted_codes.shape}, unique codes: {len(torch.unique(predicted_codes))}")
     
