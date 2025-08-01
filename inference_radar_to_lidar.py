@@ -31,7 +31,7 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "Training configuration.", lock_config=False)
 config_flags.DEFINE_config_file("radar_config", "configs/default_radar_vqgan_config.py", "Radar VQGAN training configuration.", lock_config=True)
 config_flags.DEFINE_config_file("lidar_config", "configs/default_lidar_vqgan_config.py", "Lidar VQGAN training configuration.", lock_config=True)
-flags.DEFINE_string("model_path", "/home/byounggun/r2l/x2ct-vqvae/logs/radar_to_lidar_sampler_radar_lidar/saved_models/absorbing_5000.th", "Path to trained model")
+flags.DEFINE_string("model_path", "/home/byounggun/r2l/x2ct-vqvae/logs/radar_to_lidar_sampler_radar_lidar/saved_models/absorbing_15000.th", "Path to trained model")
 flags.DEFINE_string("output_dir", "./inference_results", "Output directory for results")
 flags.DEFINE_integer("num_samples", 5, "Number of samples to inference")
 flags.DEFINE_string("radar_ultralidar_config", "configs/ultralidar_nusc_radar_debug.py", "UltraLiDAR radar config path")
@@ -312,7 +312,7 @@ def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
         return np.zeros((0, 4))  # x, y, z, intensity
 
 def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_gt, lidar_pred, sample_idx, output_dir):
-    """원본 points와 BEV 결과를 모두 시각화 - 라이다는 포인트 클라우드로"""
+    """원본 points와 BEV 결과를 모두 시각화 - 원본 radar 입력, 원본 lidar GT, 생성된 lidar 비교"""
     
     # BEV를 numpy로 변환 (multi-channel 처리)
     radar_bev_np = radar_bev[0].cpu().numpy() if radar_bev is not None else None  # (40, H, W)
@@ -343,9 +343,7 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     if lidar_pred_img is not None:
         log(f"Data ranges - Lidar Pred: [{lidar_pred_img.min():.3f}, {lidar_pred_img.max():.3f}]")
     
-    # BEV를 3D 포인트로 변환
-    radar_bev_points = bev_to_points_3d(radar_bev_np) if radar_bev_np is not None else np.zeros((0, 4))
-    lidar_gt_points = bev_to_points_3d(lidar_gt_np) if lidar_gt_np is not None else np.zeros((0, 4))
+    # BEV에서 생성된 포인트들 (예측 결과만)
     lidar_pred_points = bev_to_points_3d(lidar_pred_np) if lidar_pred_np is not None else np.zeros((0, 4))
     
     # 원본 points 준비
@@ -353,86 +351,53 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     lidar_points_np = lidar_points.cpu().numpy() if lidar_points is not None else np.zeros((0, 6))
     
     log(f"Original point counts - Radar: {len(radar_points_np)}, Lidar: {len(lidar_points_np)}")
-    log(f"Generated point counts - Radar BEV: {len(radar_bev_points)}, Lidar GT: {len(lidar_gt_points)}, Lidar Pred: {len(lidar_pred_points)}")
+    log(f"Generated point counts - Lidar Pred: {len(lidar_pred_points)}")
     
-    # 시각화 - 원본 points와 생성된 결과
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    # 시각화 - 3개 비교: 원본 radar (입력), 원본 lidar (GT), 생성된 lidar (출력)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
-    # 첫 번째 행: 원본 points
-    # Original Radar Points
+    # 1. Original Radar Points (모델 입력)
     if len(radar_points_np) > 0:
-        scatter1 = axes[0, 0].scatter(radar_points_np[:, 0], radar_points_np[:, 1], 
-                                     c=radar_points_np[:, 3] if radar_points_np.shape[1] > 3 else 'blue', 
-                                     cmap='viridis', s=2, alpha=0.7)
+        scatter1 = axes[0].scatter(radar_points_np[:, 0], radar_points_np[:, 1], 
+                                 c=radar_points_np[:, 3] if radar_points_np.shape[1] > 3 else 'blue', 
+                                 cmap='viridis', s=3, alpha=0.8)
         if radar_points_np.shape[1] > 3:
-            plt.colorbar(scatter1, ax=axes[0, 0], shrink=0.8)
-    axes[0, 0].set_title(f'Original Radar Points\n{len(radar_points_np)} points', 
-                        fontsize=12, fontweight='bold')
-    axes[0, 0].set_xlabel('X (m)')
-    axes[0, 0].set_ylabel('Y (m)')
-    axes[0, 0].set_xlim(-50, 50)
-    axes[0, 0].set_ylim(-50, 50)
-    axes[0, 0].grid(True, alpha=0.3)
+            plt.colorbar(scatter1, ax=axes[0], shrink=0.8, label='RCS')
+    axes[0].set_title(f'Input: Original Radar Points\n{len(radar_points_np)} points', 
+                    fontsize=14, fontweight='bold')
+    axes[0].set_xlabel('X (m)')
+    axes[0].set_ylabel('Y (m)')
+    axes[0].set_xlim(-50, 50)
+    axes[0].set_ylim(-50, 50)
+    axes[0].grid(True, alpha=0.3)
     
-    # Original Lidar Points
+    # 2. Original Lidar Points (Ground Truth)
     if len(lidar_points_np) > 0:
-        scatter2 = axes[0, 1].scatter(lidar_points_np[:, 0], lidar_points_np[:, 1], 
-                                     c=lidar_points_np[:, 3] if lidar_points_np.shape[1] > 3 else 'red', 
-                                     cmap='hot', s=1, alpha=0.6)
+        scatter2 = axes[1].scatter(lidar_points_np[:, 0], lidar_points_np[:, 1], 
+                                 c=lidar_points_np[:, 3] if lidar_points_np.shape[1] > 3 else 'red', 
+                                 cmap='hot', s=1, alpha=0.7)
         if lidar_points_np.shape[1] > 3:
-            plt.colorbar(scatter2, ax=axes[0, 1], shrink=0.8)
-    axes[0, 1].set_title(f'Original Lidar Points\n{len(lidar_points_np)} points', 
-                        fontsize=12, fontweight='bold')
-    axes[0, 1].set_xlabel('X (m)')
-    axes[0, 1].set_ylabel('Y (m)')
-    axes[0, 1].set_xlim(-50, 50)
-    axes[0, 1].set_ylim(-50, 50)
-    axes[0, 1].grid(True, alpha=0.3)
+            plt.colorbar(scatter2, ax=axes[1], shrink=0.8, label='Intensity')
+    axes[1].set_title(f'Ground Truth: Original Lidar Points\n{len(lidar_points_np)} points', 
+                    fontsize=14, fontweight='bold')
+    axes[1].set_xlabel('X (m)')
+    axes[1].set_ylabel('Y (m)')
+    axes[1].set_xlim(-50, 50)
+    axes[1].set_ylim(-50, 50)
+    axes[1].grid(True, alpha=0.3)
     
-    # Empty plot for symmetry
-    axes[0, 2].axis('off')
-    axes[0, 2].text(0.5, 0.5, 'Original Points\nComparison', ha='center', va='center', 
-                   transform=axes[0, 2].transAxes, fontsize=14, fontweight='bold')
-    
-    # 두 번째 행: 생성된 결과
-    # Radar BEV (기존 방식)
-    if len(radar_bev_points) > 0:
-        scatter3 = axes[1, 0].scatter(radar_bev_points[:, 0], radar_bev_points[:, 1], 
-                                     c=radar_bev_points[:, 3], cmap='viridis', s=2, alpha=0.7)
-        plt.colorbar(scatter3, ax=axes[1, 0], shrink=0.8)
-    axes[1, 0].set_title(f'Radar BEV (Input)\n{len(radar_bev_points)} points', 
-                        fontsize=12, fontweight='bold')
-    axes[1, 0].set_xlabel('X (m)')
-    axes[1, 0].set_ylabel('Y (m)')
-    axes[1, 0].set_xlim(-50, 50)
-    axes[1, 0].set_ylim(-50, 50)
-    axes[1, 0].grid(True, alpha=0.3)
-    
-    # Ground Truth Lidar Points (포인트 클라우드)
-    if len(lidar_gt_points) > 0:
-        scatter4 = axes[1, 1].scatter(lidar_gt_points[:, 0], lidar_gt_points[:, 1], 
-                                     c=lidar_gt_points[:, 3], cmap='hot', s=1, alpha=0.6)
-        plt.colorbar(scatter4, ax=axes[1, 1], shrink=0.8)
-    axes[1, 1].set_title(f'GT Lidar Points\n{len(lidar_gt_points)} points', 
-                        fontsize=12, fontweight='bold')
-    axes[1, 1].set_xlabel('X (m)')
-    axes[1, 1].set_ylabel('Y (m)')
-    axes[1, 1].set_xlim(-50, 50)
-    axes[1, 1].set_ylim(-50, 50)
-    axes[1, 1].grid(True, alpha=0.3)
-    
-    # Predicted Lidar Points (포인트 클라우드)
+    # 3. Predicted Lidar Points (모델 출력)
     if len(lidar_pred_points) > 0:
-        scatter5 = axes[1, 2].scatter(lidar_pred_points[:, 0], lidar_pred_points[:, 1], 
-                                     c=lidar_pred_points[:, 3], cmap='hot', s=1, alpha=0.6)
-        plt.colorbar(scatter5, ax=axes[1, 2], shrink=0.8)
-    axes[1, 2].set_title(f'Predicted Lidar Points\n{len(lidar_pred_points)} points', 
-                        fontsize=12, fontweight='bold')
-    axes[1, 2].set_xlabel('X (m)')
-    axes[1, 2].set_ylabel('Y (m)')
-    axes[1, 2].set_xlim(-50, 50)
-    axes[1, 2].set_ylim(-50, 50)
-    axes[1, 2].grid(True, alpha=0.3)
+        scatter3 = axes[2].scatter(lidar_pred_points[:, 0], lidar_pred_points[:, 1], 
+                                 c=lidar_pred_points[:, 3], cmap='hot', s=1, alpha=0.7)
+        plt.colorbar(scatter3, ax=axes[2], shrink=0.8, label='Predicted Intensity')
+    axes[2].set_title(f'Output: Radar-to-Lidar Result\n{len(lidar_pred_points)} points', 
+                    fontsize=14, fontweight='bold')
+    axes[2].set_xlabel('X (m)')
+    axes[2].set_ylabel('Y (m)')
+    axes[2].set_xlim(-50, 50)
+    axes[2].set_ylim(-50, 50)
+    axes[2].grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'inference_result_{sample_idx}.png'), dpi=300, bbox_inches='tight')
