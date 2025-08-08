@@ -31,7 +31,7 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", None, "Training configuration.", lock_config=False)
 config_flags.DEFINE_config_file("radar_config", "configs/default_radar_vqgan_config.py", "Radar VQGAN training configuration.", lock_config=True)
 config_flags.DEFINE_config_file("lidar_config", "configs/default_lidar_vqgan_config.py", "Lidar VQGAN training configuration.", lock_config=True)
-flags.DEFINE_string("model_path", "/home/byounggun/r2l/x2ct-vqvae/logs/radar_to_lidar_sampler_radar_lidar/saved_models/absorbing_15000.th", "Path to trained model")
+flags.DEFINE_string("model_path", "/home/byounggun/r2l/x2ct-vqvae/logs/radar_to_lidar_sampler_radar_lidar/saved_models/absorbing_110000.th", "Path to trained model")
 flags.DEFINE_string("output_dir", "./inference_results", "Output directory for results")
 flags.DEFINE_integer("num_samples", 5, "Number of samples to inference")
 flags.DEFINE_string("radar_ultralidar_config", "configs/ultralidar_nusc_radar_debug.py", "UltraLiDAR radar config path")
@@ -40,19 +40,13 @@ flags.mark_flags_as_required(["config"])
 
 def setup_device(config):
     """GPU 설정 및 디바이스 선택"""
-    if hasattr(config.run, 'use_cuda') and config.run.use_cuda and torch.cuda.is_available():
-        if hasattr(config.run, 'gpu_id'):
-            gpu_id = config.run.gpu_id
-            if gpu_id < torch.cuda.device_count():
-                torch.cuda.set_device(gpu_id)
-                device = torch.device(f'cuda:{gpu_id}')
-                log(f"Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
-            else:
-                device = torch.device('cuda')
-                log(f"GPU {gpu_id} not available, using default GPU")
-        else:
-            device = torch.device('cuda')
-            log("Using default CUDA device")
+    # 강제로 GPU 0번 사용
+    if torch.cuda.is_available():
+        gpu_id = 0  # 강제로 0번 GPU 사용
+        torch.cuda.set_device(gpu_id)
+        device = torch.device(f'cuda:{gpu_id}')
+        log(f"FORCED to use GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+        log(f"GPU Memory: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.1f} GB")
     else:
         device = torch.device('cpu')
         log("Using CPU")
@@ -259,9 +253,29 @@ def reconstruct_from_codes(H, sampler, codes, generator):
     log(f"q shape after embedding lookup: {q.shape}")
     
     images = generator(q.float())
+    
+    # UltraLiDAR decoder는 sigmoid 출력을 사용하므로 [0,1] 범위
+    # 하지만 원본 LiDAR BEV는 [0, 253] 정도의 범위를 가짐
+    # 따라서 스케일링이 필요
+    
+    # 1단계: 음수값 제거 (decoder 오류로 인한)
+    images = torch.relu(images)
+    log(f"After ReLU - range: [{images.min():.3f}, {images.max():.3f}]")
+    
+    # 2단계: 값이 이미 큰 경우를 고려한 스케일링
+    max_val = images.max()
+    if max_val > 1.0:
+        # 이미 큰 값이면 255로 나누어서 정규화 후 다시 곱하기
+        images = (images / max_val) * 255.0
+        log(f"Normalized and scaled - range: [{images.min():.3f}, {images.max():.3f}]")
+    else:
+        # [0,1] 범위라면 255를 곱하기
+        images = images * 255.0
+        log(f"Scaled from [0,1] to [0,255] - range: [{images.min():.3f}, {images.max():.3f}]")
+    
     return images
 
-def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
+def bev_to_points_3d(bev_image, intensity_threshold=0.0, range_limit=50.0, adaptive_threshold=False):
     """Multi-channel BEV 이미지를 3D 포인트로 변환 (x, y, z, intensity)"""
     if isinstance(bev_image, torch.Tensor):
         bev_image = bev_image.cpu().numpy()
@@ -275,6 +289,26 @@ def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
     
     num_bins, height, width = bev_image.shape
     
+    # LiDAR는 intensity와 상관없이 모든 non-zero 위치에 점이 존재
+    # 매우 작은 threshold만 사용해서 거의 모든 점을 포함
+    intensity_threshold = 1e-8  # 거의 0에 가까운 값
+    
+    # 값 분포 상세 분석
+    non_zero_values = bev_image[bev_image > 0]
+    if len(non_zero_values) > 0:
+        log(f"BEV value distribution:")
+        log(f"  Total pixels: {bev_image.size}, Non-zero: {len(non_zero_values)}")
+        log(f"  Min: {non_zero_values.min():.6f}, Max: {non_zero_values.max():.6f}")
+        log(f"  Mean: {non_zero_values.mean():.6f}, Std: {non_zero_values.std():.6f}")
+        
+        # 다양한 임계값으로 점 개수 예상
+        test_thresholds = [0, 1e-8, 1e-6, 1e-4, 1e-2]
+        for thresh in test_thresholds:
+            count = (bev_image > thresh).sum()
+            log(f"  Threshold {thresh:.8f}: {count} pixels would generate points")
+    else:
+        log(f"No non-zero values found in BEV")
+    
     # Height bin 파라미터
     z_min = -5.0
     z_max = 3.0
@@ -286,7 +320,7 @@ def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
         # 현재 bin의 2D slice
         slice_img = bev_image[bin_idx]
         
-        # 임계값보다 큰 위치 찾기
+        # 0보다 큰 모든 위치 찾기 (intensity 값과 상관없이)
         y_indices, x_indices = np.where(slice_img > intensity_threshold)
         
         if len(x_indices) == 0:
@@ -299,7 +333,7 @@ def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
         # Z 좌표 계산: bin 중심
         z_coords = np.full_like(x_coords, z_min + (bin_idx + 0.5) * z_bin_size)
         
-        # 강도값
+        # 강도값 (실제 BEV 값 사용)
         intensities = slice_img[y_indices, x_indices]
         
         # 결합
@@ -307,8 +341,11 @@ def bev_to_points_3d(bev_image, intensity_threshold=0.01, range_limit=50.0):
         points_list.append(slice_points)
     
     if points_list:
-        return np.concatenate(points_list, axis=0)
+        total_points = np.concatenate(points_list, axis=0)
+        log(f"Generated {len(total_points)} points (all non-zero BEV pixels)")
+        return total_points
     else:
+        log(f"No points generated - BEV is empty")
         return np.zeros((0, 4))  # x, y, z, intensity
 
 def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_gt, lidar_pred, sample_idx, output_dir):
@@ -343,8 +380,8 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     if lidar_pred_img is not None:
         log(f"Data ranges - Lidar Pred: [{lidar_pred_img.min():.3f}, {lidar_pred_img.max():.3f}]")
     
-    # BEV에서 생성된 포인트들 (예측 결과만)
-    lidar_pred_points = bev_to_points_3d(lidar_pred_np) if lidar_pred_np is not None else np.zeros((0, 4))
+    # BEV에서 생성된 포인트들 (예측 결과만) - 모든 non-zero 픽셀 포함
+    lidar_pred_points = bev_to_points_3d(lidar_pred_np, adaptive_threshold=False) if lidar_pred_np is not None else np.zeros((0, 4))
     
     # 원본 points 준비
     radar_points_np = radar_points.cpu().numpy() if radar_points is not None else np.zeros((0, 6))
@@ -352,6 +389,14 @@ def visualize_results_with_points(radar_points, radar_bev, lidar_points, lidar_g
     
     log(f"Original point counts - Radar: {len(radar_points_np)}, Lidar: {len(lidar_points_np)}")
     log(f"Generated point counts - Lidar Pred: {len(lidar_pred_points)}")
+    
+    # 데이터 범위와 포인트 생성 정보 로그
+    if lidar_pred_np is not None:
+        pred_non_zero = (lidar_pred_np > 0).sum()
+        pred_above_001 = (lidar_pred_np > 0.001).sum() 
+        pred_above_01 = (lidar_pred_np > 0.01).sum()
+        log(f"Prediction BEV analysis - Non-zero: {pred_non_zero}, >0.001: {pred_above_001}, >0.01: {pred_above_01}")
+        log(f"Prediction BEV range: [{lidar_pred_np.min():.6f}, {lidar_pred_np.max():.6f}]")
     
     # 시각화 - 3개 비교: 원본 radar (입력), 원본 lidar (GT), 생성된 lidar (출력)
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -614,9 +659,17 @@ def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lid
             
             # context를 복제하여 배치 크기를 맞춤
             if context.size(0) == 1:
+                # 메모리 절약을 위해 더 작은 sampling_steps 사용
+                original_steps = H.diffusion.sampling_steps
+                H.diffusion.sampling_steps = min(512, original_steps)  # 절반으로 줄임
+                log(f"Reduced sampling steps from {original_steps} to {H.diffusion.sampling_steps} for memory")
+                
                 # 필요시 배치 크기를 2로 확장
                 context_expanded = context.repeat(2, 1, 1)
                 log(f"Expanded context shape: {context_expanded.shape}")
+                
+                # GPU 메모리 정리
+                torch.cuda.empty_cache()
                 
                 predicted_codes = sampler.sample(
                     context=context_expanded,
@@ -626,6 +679,9 @@ def inference_single_sample_direct(H, sampler, ae_radar, ae_lidar, generator_lid
                 
                 # 첫 번째 결과만 사용
                 predicted_codes = predicted_codes[:1]
+                
+                # sampling_steps 복원
+                H.diffusion.sampling_steps = original_steps
             else:
                 raise e
         else:
@@ -757,8 +813,8 @@ def inference_single_sample_from_points(H, sampler, ae_radar, ae_lidar, generato
         'inference_time': inference_time
     }
 
-def bev_to_points_lidar(bev_image, intensity_threshold=0.01, range_limit=50.0):
-    return bev_to_points_3d(bev_image, intensity_threshold, range_limit)
+def bev_to_points_lidar(bev_image, intensity_threshold=0.0, range_limit=50.0):
+    return bev_to_points_3d(bev_image, intensity_threshold, range_limit, adaptive_threshold=False)
 
 
 def main(argv):
@@ -896,6 +952,9 @@ def main(argv):
     for i in range(max_samples):
         log(f"Processing sample {i+1}/{max_samples}")
         
+        # GPU 메모리 정리 (매 샘플마다)
+        torch.cuda.empty_cache()
+        
         try:
             # 데이터 로드 및 points 미리 추출
             radar_data = radar_dataset[i]
@@ -973,9 +1032,9 @@ def main(argv):
                 **save_data
             )
 
-            # Save point clouds as PLY
-            lidar_gt_points_3d = bev_to_points_3d(results['lidar_bev']) if results['lidar_bev'] is not None else np.zeros((0, 4))
-            lidar_pred_points_3d = bev_to_points_3d(results['lidar_predicted']) if results['lidar_predicted'] is not None else np.zeros((0, 4))
+            # Save point clouds as PLY - 모든 non-zero 픽셀 포함
+            lidar_gt_points_3d = bev_to_points_3d(results['lidar_bev'], adaptive_threshold=False) if results['lidar_bev'] is not None else np.zeros((0, 4))
+            lidar_pred_points_3d = bev_to_points_3d(results['lidar_predicted'], adaptive_threshold=False) if results['lidar_predicted'] is not None else np.zeros((0, 4))
             save_pointclouds_as_ply(lidar_gt_points_3d, lidar_pred_points_3d, num_success+1, output_dir)
 
             num_success += 1

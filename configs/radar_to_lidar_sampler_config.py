@@ -21,7 +21,7 @@ def get_config():
     run.visdom_port = 8097
     run.log_to_file = False
     # GPU 설정
-    run.gpu_id = 1  # 사용할 GPU 번호 (0,1,2,3 중 선택)
+    run.gpu_id = 0  # 사용할 GPU 번호 (0,1,2,3 중 선택)
     run.use_cuda = True
 
     #######################################################################
